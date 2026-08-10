@@ -3,8 +3,10 @@
 print("Replaced the original vllm gpu_model_runner with the Monet version.")
 import copy
 import gc
+import hashlib
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 import os
 
@@ -345,6 +347,172 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.latent_state: dict[str, dict[str, Any]] = {}
         self.latent_size = latent_size
 
+        # Optional analysis recorder. The normal inference path is unchanged
+        # unless MONET_ANALYSIS_CAPTURE_DIR is set before vLLM is imported.
+        capture_dir = os.getenv("MONET_ANALYSIS_CAPTURE_DIR", "").strip()
+        self.analysis_capture_enabled = bool(capture_dir)
+        self.analysis_capture_dir: Optional[Path] = None
+        self.analysis_capture_state: dict[str, dict[str, Any]] = {}
+        if self.analysis_capture_enabled:
+            if (self.parallel_config.tensor_parallel_size != 1
+                    or self.parallel_config.pipeline_parallel_size != 1):
+                raise RuntimeError(
+                    "Monet analysis capture requires tensor_parallel_size=1 "
+                    "and pipeline_parallel_size=1 to avoid partial or "
+                    "duplicate worker captures.")
+            self.analysis_capture_dir = Path(capture_dir).expanduser().resolve()
+            self.analysis_capture_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("Monet analysis capture enabled: %s",
+                        self.analysis_capture_dir)
+
+    def _analysis_start_request(self, req_id: str,
+                                prompt_token_ids: list[int]) -> None:
+        if not self.analysis_capture_enabled:
+            return
+        self.analysis_capture_state[req_id] = {
+            "prompt_length": len(prompt_token_ids),
+            "vectors": [],
+            "kind_codes": [],
+            "token_ids": [],
+            "sequence_positions": [],
+            "generation_steps": [],
+            "latent_indices": [],
+            "seen_positions": set(),
+        }
+
+    @staticmethod
+    def _analysis_is_image_position(req_state: CachedRequestState,
+                                    sequence_position: int) -> bool:
+        for pos_info in req_state.mm_positions:
+            relative_position = sequence_position - pos_info.offset
+            if relative_position < 0:
+                return False
+            if relative_position >= pos_info.length:
+                continue
+            is_embed = pos_info.is_embed
+            if is_embed is None:
+                return True
+            value = is_embed[relative_position]
+            if hasattr(value, "item"):
+                value = value.item()
+            return bool(value)
+        return False
+
+    def _analysis_capture_inputs(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        latent_rows: dict[int, int],
+    ) -> None:
+        """Capture the exact vectors consumed by the decoder in this step.
+
+        Kind codes are stable and intentionally simple for portable NPZ files:
+        0=prompt_text, 1=image_feature, 2=latent, 3=response_text.
+        """
+        if not self.analysis_capture_enabled:
+            return
+
+        row_start = 0
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            row_count = int(num_scheduled_tokens[req_index])
+            row_end = row_start + row_count
+            if row_count == 0:
+                row_start = row_end
+                continue
+
+            req_state = self.requests[req_id]
+            state = self.analysis_capture_state.get(req_id)
+            if state is None:
+                self._analysis_start_request(req_id,
+                                             req_state.prompt_token_ids)
+                state = self.analysis_capture_state[req_id]
+
+            sequence_start = int(req_state.num_computed_tokens)
+            keep_rows = []
+            kind_codes = []
+            token_ids = []
+            sequence_positions = []
+            generation_steps = []
+            latent_indices = []
+            seen_positions = state["seen_positions"]
+            prompt_length = int(state["prompt_length"])
+
+            for local_row, global_row in enumerate(range(row_start, row_end)):
+                sequence_position = sequence_start + local_row
+                if sequence_position in seen_positions:
+                    continue
+                seen_positions.add(sequence_position)
+                keep_rows.append(global_row)
+                token_ids.append(int(self.input_ids_cpu[global_row].item()))
+                sequence_positions.append(sequence_position)
+                generation_steps.append(
+                    sequence_position - prompt_length
+                    if sequence_position >= prompt_length else -1)
+
+                if global_row in latent_rows:
+                    kind_codes.append(2)
+                    latent_indices.append(int(latent_rows[global_row]))
+                elif sequence_position < prompt_length:
+                    is_image = self._analysis_is_image_position(
+                        req_state, sequence_position)
+                    kind_codes.append(1 if is_image else 0)
+                    latent_indices.append(-1)
+                else:
+                    kind_codes.append(3)
+                    latent_indices.append(-1)
+
+            if keep_rows:
+                rows = torch.tensor(keep_rows,
+                                    dtype=torch.int64,
+                                    device=self.device)
+                vectors = self.inputs_embeds.index_select(0, rows)
+                state["vectors"].append(
+                    vectors.detach().to(device="cpu",
+                                        dtype=torch.float16).numpy())
+                state["kind_codes"].append(
+                    np.asarray(kind_codes, dtype=np.uint8))
+                state["token_ids"].append(
+                    np.asarray(token_ids, dtype=np.int32))
+                state["sequence_positions"].append(
+                    np.asarray(sequence_positions, dtype=np.int32))
+                state["generation_steps"].append(
+                    np.asarray(generation_steps, dtype=np.int32))
+                state["latent_indices"].append(
+                    np.asarray(latent_indices, dtype=np.int32))
+
+            row_start = row_end
+
+    def _analysis_flush_request(self, req_id: str) -> None:
+        if not self.analysis_capture_enabled:
+            return
+        state = self.analysis_capture_state.pop(req_id, None)
+        if state is None or not state["vectors"]:
+            return
+        assert self.analysis_capture_dir is not None
+
+        vectors = np.concatenate(state["vectors"], axis=0)
+        kind_codes = np.concatenate(state["kind_codes"])
+        token_ids = np.concatenate(state["token_ids"])
+        sequence_positions = np.concatenate(state["sequence_positions"])
+        generation_steps = np.concatenate(state["generation_steps"])
+        latent_indices = np.concatenate(state["latent_indices"])
+        order = np.argsort(sequence_positions, kind="stable")
+
+        digest = hashlib.sha1(req_id.encode("utf-8")).hexdigest()[:12]
+        final_path = self.analysis_capture_dir / f"capture_{digest}.npz"
+        temp_path = self.analysis_capture_dir / f"capture_{digest}.tmp.npz"
+        np.savez(
+            temp_path,
+            request_id=np.asarray(req_id),
+            prompt_length=np.asarray(state["prompt_length"], dtype=np.int32),
+            vectors=vectors[order],
+            kind_codes=kind_codes[order],
+            token_ids=token_ids[order],
+            sequence_positions=sequence_positions[order],
+            generation_steps=generation_steps[order],
+            latent_indices=latent_indices[order],
+        )
+        os.replace(temp_path, final_path)
+
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -401,8 +569,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            self._analysis_flush_request(req_id)
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
+            self.latent_state.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -470,6 +640,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
             )
+            self._analysis_start_request(req_id,
+                                         new_req_data.prompt_token_ids)
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -1432,6 +1604,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.inputs_embeds[:num_scheduled_tokens].copy_(inputs_embeds)
 
             # ABS-VIS: override next-step inputs with pending hidden states
+            analysis_latent_rows: dict[int, int] = {}
             if (self.latent_enabled and get_pp_group().is_last_rank
                     and not self.speculative_config):
                 # Only safe on single PP rank (first==last); guard otherwise
@@ -1445,8 +1618,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for i, req_id in enumerate(self.input_batch.req_ids):
                         st = self.latent_state.get(req_id)
                         if st and st.get("active") and st.get("pending") is not None:
-                            override_indices.append(rows_cpu[i].item())
+                            override_row = rows_cpu[i].item()
+                            override_indices.append(override_row)
                             override_embeds.append(st["pending"])  # Tensor [H]
+                            analysis_latent_rows[override_row] = int(
+                                st.get("current_len", 0))
                     if override_indices:
                         idx = torch.tensor(override_indices, device=self.device,
                                            dtype=torch.int64)
@@ -1458,6 +1634,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             st = self.latent_state.get(req_id)
                             if st and st.get("active"):
                                 st["pending"] = None
+            self._analysis_capture_inputs(num_scheduled_tokens_np,
+                                          analysis_latent_rows)
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
             input_ids = None
         else:

@@ -18,6 +18,8 @@ sentencepiece
 requests
 numpy
 scipy
+scikit-learn
+plotly
 opencv-python-headless
 fastapi
 uvicorn
