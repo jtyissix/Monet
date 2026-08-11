@@ -19,7 +19,7 @@ requests
 numpy
 scipy
 scikit-learn
-vtk
+matplotlib
 opencv-python-headless
 fastapi
 uvicorn

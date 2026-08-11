@@ -365,6 +365,73 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info("Monet analysis capture enabled: %s",
                         self.analysis_capture_dir)
 
+    def _analysis_export_vocabulary_embeddings(
+            self, batch_size: int = 8192) -> dict[str, Any]:
+        """Export the model's complete input embedding table in chunks."""
+        if not self.analysis_capture_enabled:
+            raise RuntimeError("Monet analysis capture is disabled.")
+        if batch_size <= 0:
+            raise ValueError("Vocabulary embedding batch size must be positive.")
+        if not hasattr(self, "model"):
+            raise RuntimeError("The model is not loaded on this worker.")
+        assert self.analysis_capture_dir is not None
+
+        vocab_size = int(self.model_config.get_vocab_size())
+        if vocab_size <= 0:
+            raise RuntimeError(f"Invalid model vocabulary size: {vocab_size}")
+        final_path = self.analysis_capture_dir / "vocabulary_embeddings.npy"
+        temporary_path = (
+            self.analysis_capture_dir / ".vocabulary_embeddings.tmp.npy")
+        vocabulary_memmap = None
+        hidden_size = None
+        try:
+            with torch.inference_mode():
+                for start in range(0, vocab_size, batch_size):
+                    end = min(start + batch_size, vocab_size)
+                    token_ids = torch.arange(
+                        start, end, dtype=torch.int64, device=self.device)
+                    embeddings = self.model.get_input_embeddings(
+                        input_ids=token_ids, multimodal_embeddings=None)
+                    if not isinstance(embeddings, torch.Tensor):
+                        raise TypeError(
+                            "get_input_embeddings() did not return a Tensor.")
+                    if embeddings.ndim != 2 or embeddings.shape[0] != end - start:
+                        raise RuntimeError(
+                            "Unexpected vocabulary embedding shape: "
+                            f"{tuple(embeddings.shape)}")
+                    if vocabulary_memmap is None:
+                        hidden_size = int(embeddings.shape[1])
+                        vocabulary_memmap = np.lib.format.open_memmap(
+                            temporary_path,
+                            mode="w+",
+                            dtype=np.float16,
+                            shape=(vocab_size, hidden_size),
+                        )
+                    elif int(embeddings.shape[1]) != hidden_size:
+                        raise RuntimeError(
+                            "Vocabulary embedding hidden size changed while "
+                            "exporting.")
+                    vocabulary_memmap[start:end] = embeddings.detach().to(
+                        device="cpu", dtype=torch.float16).numpy()
+            assert vocabulary_memmap is not None and hidden_size is not None
+            vocabulary_memmap.flush()
+            del vocabulary_memmap
+            vocabulary_memmap = None
+            os.replace(temporary_path, final_path)
+        finally:
+            if vocabulary_memmap is not None:
+                del vocabulary_memmap
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+        return {
+            "path": str(final_path),
+            "vocab_size": vocab_size,
+            "hidden_size": hidden_size,
+            "dtype": "float16",
+            "batch_size": batch_size,
+        }
+
     def _analysis_start_request(self, req_id: str,
                                 prompt_token_ids: list[int]) -> None:
         if not self.analysis_capture_enabled:
@@ -405,8 +472,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> None:
         """Capture the exact vectors consumed by the decoder in this step.
 
-        Kind codes are stable and intentionally simple for portable NPZ files:
-        0=prompt_text, 1=image_feature, 2=latent, 3=response_text.
+        Only image features and latent vectors are retained. Kind codes keep
+        their original stable values: 1=image_feature and 2=latent.
         """
         if not self.analysis_capture_enabled:
             return
@@ -441,24 +508,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if sequence_position in seen_positions:
                     continue
                 seen_positions.add(sequence_position)
+                if global_row in latent_rows:
+                    kind_code = 2
+                    latent_index = int(latent_rows[global_row])
+                elif sequence_position < prompt_length:
+                    is_image = self._analysis_is_image_position(
+                        req_state, sequence_position)
+                    if not is_image:
+                        continue
+                    kind_code = 1
+                    latent_index = -1
+                else:
+                    continue
+
                 keep_rows.append(global_row)
+                kind_codes.append(kind_code)
                 token_ids.append(int(self.input_ids_cpu[global_row].item()))
                 sequence_positions.append(sequence_position)
                 generation_steps.append(
                     sequence_position - prompt_length
                     if sequence_position >= prompt_length else -1)
-
-                if global_row in latent_rows:
-                    kind_codes.append(2)
-                    latent_indices.append(int(latent_rows[global_row]))
-                elif sequence_position < prompt_length:
-                    is_image = self._analysis_is_image_position(
-                        req_state, sequence_position)
-                    kind_codes.append(1 if is_image else 0)
-                    latent_indices.append(-1)
-                else:
-                    kind_codes.append(3)
-                    latent_indices.append(-1)
+                latent_indices.append(latent_index)
 
             if keep_rows:
                 rows = torch.tensor(keep_rows,
@@ -496,6 +566,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         generation_steps = np.concatenate(state["generation_steps"])
         latent_indices = np.concatenate(state["latent_indices"])
         order = np.argsort(sequence_positions, kind="stable")
+        prompt_length = int(state["prompt_length"])
+        consumed_output_positions = [
+            position - prompt_length
+            for position in state["seen_positions"]
+            if position >= prompt_length
+        ]
+        consumed_output_token_count = (
+            max(consumed_output_positions) + 1
+            if consumed_output_positions else 0)
 
         digest = hashlib.sha1(req_id.encode("utf-8")).hexdigest()[:12]
         final_path = self.analysis_capture_dir / f"capture_{digest}.npz"
@@ -503,7 +582,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         np.savez(
             temp_path,
             request_id=np.asarray(req_id),
-            prompt_length=np.asarray(state["prompt_length"], dtype=np.int32),
+            prompt_length=np.asarray(prompt_length, dtype=np.int32),
+            consumed_output_token_count=np.asarray(
+                consumed_output_token_count, dtype=np.int32),
             vectors=vectors[order],
             kind_codes=kind_codes[order],
             token_ids=token_ids[order],

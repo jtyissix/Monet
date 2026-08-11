@@ -5,8 +5,9 @@ Edit the global variables in the configuration section below, then run:
     python -m inference.vllm_hrbench_pca_analysis
 
 There is deliberately no command-line interface. The Monet runner writes
-temporary float16 captures, this script performs a balanced joint PCA, and the
-temporary high-dimensional vectors are removed after successful projection.
+temporary float16 image/latent captures and the complete vocabulary input
+embedding table. This script projects all requested vectors with one PCA and
+removes the temporary high-dimensional data after successful projection.
 """
 
 from __future__ import annotations
@@ -39,14 +40,14 @@ MODEL_PATH = "/home/fit/renjujty/WORK/jty/lmllms/monet/"
 HRBENCH_DIR = "/home/fit/renjujty/WORK/jty/lmllms/hrbench/"
 HRBENCH_FILE = "hr_bench_4k.parquet"
 OUTPUT_DIR = "outputs/hrbench_pca"
-POINT_CLOUD_VTP_FILE = "hrbench_point_cloud.vtp"
-TRAJECTORY_VTP_FILE = "hrbench_trajectories.vtp"
+JOINT_PCA_FILE = "joint_pca_3d.npz"
+LATENT_TRAJECTORY_FILE = "latent_trajectories.npz"
 
 # "sequential": START_INDEX ... START_INDEX + NUM_SAMPLES
 # "random": deterministic sampling without replacement using RANDOM_SEED
-SELECTION_MODE = "sequential"
+SELECTION_MODE = "random"
 START_INDEX = 0
-NUM_SAMPLES = 10
+NUM_SAMPLES = 100
 RANDOM_SEED = 0
 
 LATENT_SIZE = 10
@@ -70,19 +71,14 @@ REPETITION_PENALTY = 1.01
 BEST_OF = 1
 STOP = None
 
-# Every non-empty kind contributes exactly this many rows to PCA fitting.
-# Kinds with fewer rows are deterministically sampled with replacement.
-PCA_FIT_POINTS_PER_KIND = 2048
+VOCAB_EMBEDDING_BATCH_SIZE = 8192
 PCA_TRANSFORM_BATCH_SIZE = 8192
 
-VTP_COMPRESSION_LEVEL = 6
 CAPTURE_WAIT_SECONDS = 5
 KEEP_TEMP_CAPTURE_ON_ERROR = False
 
 
-KIND_NAMES = np.asarray(
-    ["prompt_text", "image_feature", "latent", "response_text"]
-)
+KIND_NAMES = np.asarray(["vocabulary_embedding", "image_feature", "latent"])
 REQUIRED_COLUMNS = {
     "index", "question", "answer", "category", "A", "B", "C", "D",
     "cycle_category", "image",
@@ -122,6 +118,9 @@ def inspect_analysis_worker(worker) -> dict[str, Any]:
         "has_flush_all": callable(
             getattr(runner, "_analysis_flush_all_requests", None)
         ),
+        "has_export_vocabulary": callable(
+            getattr(runner, "_analysis_export_vocabulary_embeddings", None)
+        ),
         "pending_request_ids": sorted(
             getattr(runner, "analysis_capture_state", {}).keys()
         ),
@@ -146,6 +145,26 @@ def flush_analysis_worker(worker) -> dict[str, Any]:
     }
 
 
+def export_vocabulary_embeddings_worker(worker) -> dict[str, Any]:
+    """Export the complete input embedding table inside the GPU worker."""
+    runner = getattr(worker, "model_runner", None)
+    exporter = getattr(
+        runner, "_analysis_export_vocabulary_embeddings", None
+    )
+    if runner is None or not callable(exporter):
+        return {
+            "error": "Monet vocabulary exporter is unavailable",
+            "status": inspect_analysis_worker(worker),
+        }
+    try:
+        return exporter(VOCAB_EMBEDDING_BATCH_SIZE)
+    except Exception as exc:
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "status": inspect_analysis_worker(worker),
+        }
+
+
 def validate_analysis_worker_statuses(
     statuses: list[dict[str, Any]], capture_dir: Path
 ) -> None:
@@ -168,6 +187,10 @@ def validate_analysis_worker_statuses(
             problems.append(f"worker {index}: recorder is disabled")
         if not status.get("has_flush_all"):
             problems.append(f"worker {index}: flush-all method is missing")
+        if not status.get("has_export_vocabulary"):
+            problems.append(
+                f"worker {index}: vocabulary exporter method is missing"
+            )
         actual_capture_dir = status.get("capture_dir")
         if actual_capture_dir is None:
             problems.append(f"worker {index}: capture directory is unset")
@@ -225,18 +248,8 @@ def validate_configuration() -> tuple[Path, Path, Path]:
         raise ValueError("Analysis capture currently requires TP=1.")
     if LATENT_SIZE <= 0:
         raise ValueError("LATENT_SIZE must be positive.")
-    if PCA_FIT_POINTS_PER_KIND <= 0 or PCA_TRANSFORM_BATCH_SIZE <= 0:
-        raise ValueError("PCA point and batch sizes must be positive.")
-    if not 1 <= VTP_COMPRESSION_LEVEL <= 9:
-        raise ValueError("VTP_COMPRESSION_LEVEL must be between 1 and 9.")
-    try:
-        from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter  # noqa: F401
-        from vtkmodules.util.numpy_support import numpy_to_vtk  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "ParaView VTP export requires the 'vtk' package. Install the "
-            "updated requirements.txt before starting inference."
-        ) from exc
+    if VOCAB_EMBEDDING_BATCH_SIZE <= 0 or PCA_TRANSFORM_BATCH_SIZE <= 0:
+        raise ValueError("Vocabulary and PCA batch sizes must be positive.")
 
     model_path = Path(MODEL_PATH).expanduser()
     dataset_path = Path(HRBENCH_DIR).expanduser() / HRBENCH_FILE
@@ -446,6 +459,38 @@ def run_inference(
         "[Monet analysis] validated worker:\n"
         + json.dumps(worker_statuses, ensure_ascii=False, indent=2)
     )
+    vocabulary_exports = engine.collective_rpc(
+        export_vocabulary_embeddings_worker, timeout=None
+    )
+    if len(vocabulary_exports) != 1 or vocabulary_exports[0].get("error"):
+        raise RuntimeError(
+            "Failed to export vocabulary input embeddings:\n"
+            + json.dumps(vocabulary_exports, ensure_ascii=False, indent=2)
+        )
+    vocabulary_export = vocabulary_exports[0]
+    vocabulary_path = Path(vocabulary_export["path"]).resolve()
+    if (
+        vocabulary_path.parent != capture_dir.resolve()
+        or not vocabulary_path.is_file()
+    ):
+        raise RuntimeError(
+            "Vocabulary exporter returned an invalid path: "
+            f"{vocabulary_path}"
+        )
+    vocabulary_shape = np.load(vocabulary_path, mmap_mode="r").shape
+    expected_shape = (
+        int(vocabulary_export["vocab_size"]),
+        int(vocabulary_export["hidden_size"]),
+    )
+    if vocabulary_shape != expected_shape:
+        raise RuntimeError(
+            "Vocabulary embedding shape mismatch: "
+            f"{vocabulary_shape} != {expected_shape}"
+        )
+    print(
+        "[Monet analysis] vocabulary export complete:\n"
+        + json.dumps(vocabulary_export, ensure_ascii=False, indent=2)
+    )
     conversations, images = build_conversations(rows, dataset_dir)
     try:
         inputs = process_messages(conversations, processor)
@@ -470,7 +515,7 @@ def run_inference(
     finally:
         for image in images:
             image.close()
-    return outputs, processor, worker_statuses
+    return outputs, worker_statuses, vocabulary_export
 
 
 def wait_for_captures(
@@ -509,400 +554,314 @@ def wait_for_captures(
     )
 
 
-def load_capture(path: Path) -> dict[str, Any]:
-    with np.load(path, allow_pickle=False) as data:
-        return {key: data[key].copy() for key in data.files}
+def scan_capture_counts(
+    capture_paths: list[Path],
+) -> tuple[np.ndarray, np.ndarray]:
+    image_counts = np.zeros(len(capture_paths), dtype=np.int64)
+    latent_counts = np.zeros(len(capture_paths), dtype=np.int64)
+    for sample_ordinal, path in enumerate(capture_paths):
+        with np.load(path, allow_pickle=False) as data:
+            kind_codes = data["kind_codes"]
+            image_counts[sample_ordinal] = np.count_nonzero(kind_codes == 1)
+            latent_counts[sample_ordinal] = np.count_nonzero(kind_codes == 2)
+    return image_counts, latent_counts
 
 
-def balanced_pca(
-    captures: list[dict[str, Any]],
-) -> tuple[PCA, list[np.ndarray], dict[str, int]]:
+def sample_image_positions(
+    available_count: int, target_count: int
+) -> tuple[np.ndarray, bool]:
+    if available_count <= 0:
+        raise ValueError("No image features were captured for PCA.")
+    if target_count <= 0:
+        raise ValueError("The image feature sample size must be positive.")
+    replace = available_count < target_count
     rng = np.random.default_rng(RANDOM_SEED)
-    fit_blocks = []
-    available_counts = {}
-    for kind_code, kind_name in enumerate(KIND_NAMES.tolist()):
-        locations = []
-        total = 0
-        for capture_index, capture in enumerate(captures):
-            indices = np.flatnonzero(capture["kind_codes"] == kind_code)
-            if indices.size:
-                locations.append((capture_index, indices))
-                total += int(indices.size)
-        available_counts[kind_name] = total
-        if total == 0:
-            continue
-
-        chosen = rng.choice(
-            total,
-            size=PCA_FIT_POINTS_PER_KIND,
-            replace=total < PCA_FIT_POINTS_PER_KIND,
-        )
-        cumulative = np.cumsum(
-            [len(indices) for _, indices in locations], dtype=np.int64
-        )
-        location_indices = np.searchsorted(cumulative, chosen, side="right")
-        previous_cumulative = np.concatenate((np.asarray([0]), cumulative[:-1]))
-        hidden_size = int(captures[locations[0][0]]["vectors"].shape[1])
-        fit_block = np.empty(
-            (PCA_FIT_POINTS_PER_KIND, hidden_size), dtype=np.float32
-        )
-        for location_index, (capture_index, indices) in enumerate(locations):
-            output_rows = np.flatnonzero(location_indices == location_index)
-            if not output_rows.size:
-                continue
-            offsets = chosen[output_rows] - previous_cumulative[location_index]
-            source_rows = indices[offsets]
-            fit_block[output_rows] = captures[capture_index]["vectors"][
-                source_rows
-            ]
-        fit_blocks.append(fit_block)
-
-    if not fit_blocks or sum(block.shape[0] for block in fit_blocks) < 3:
-        raise ValueError("Fewer than three captured vectors are available for PCA.")
-    fit_matrix = np.concatenate(fit_blocks, axis=0)
-    pca = PCA(n_components=3, svd_solver="randomized", random_state=RANDOM_SEED)
-    pca.fit(fit_matrix)
-    del fit_matrix, fit_blocks
-
-    projected = []
-    for capture in captures:
-        vectors = capture["vectors"]
-        chunks = []
-        for start in range(0, len(vectors), PCA_TRANSFORM_BATCH_SIZE):
-            batch = vectors[start:start + PCA_TRANSFORM_BATCH_SIZE]
-            chunks.append(pca.transform(batch.astype(np.float32, copy=False)))
-        projected.append(np.concatenate(chunks).astype(np.float32, copy=False))
-    return pca, projected, available_counts
+    positions = rng.choice(
+        available_count, size=target_count, replace=replace
+    )
+    return np.sort(positions.astype(np.int64, copy=False)), replace
 
 
-def decode_token(tokenizer, token_id: int) -> str:
-    try:
-        text = tokenizer.decode(
-            [int(token_id)],
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-    except TypeError:
-        text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
-    if text:
-        return text
-    converted = tokenizer.convert_ids_to_tokens(int(token_id))
-    return str(converted)
-
-
-def assemble_points(
-    captures: list[dict[str, Any]],
-    projected: list[np.ndarray],
+def extract_image_and_latent_vectors(
+    capture_paths: list[Path],
     sample_records: list[dict[str, Any]],
-    tokenizer,
+    target_image_count: int,
+    hidden_size: int,
+    temporary_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]:
+    image_counts, latent_counts = scan_capture_counts(capture_paths)
+    total_images = int(image_counts.sum())
+    total_latents = int(latent_counts.sum())
+    chosen_images, used_replacement = sample_image_positions(
+        total_images, target_image_count
+    )
+
+    image_path = temporary_dir / "sampled_image_embeddings.npy"
+    image_vectors = np.lib.format.open_memmap(
+        image_path,
+        mode="w+",
+        dtype=np.float16,
+        shape=(target_image_count, hidden_size),
+    )
+    latent_vectors = np.empty((total_latents, hidden_size), dtype=np.float16)
+    image_sample_ordinals = np.empty(target_image_count, dtype=np.int32)
+    image_sequence_positions = np.empty(target_image_count, dtype=np.int32)
+    image_generation_steps = np.empty(target_image_count, dtype=np.int32)
+    latent_sample_ordinals = np.empty(total_latents, dtype=np.int32)
+    latent_sequence_positions = np.empty(total_latents, dtype=np.int32)
+    latent_generation_steps = np.empty(total_latents, dtype=np.int32)
+    latent_indices = np.empty(total_latents, dtype=np.int32)
+    latent_trajectory_steps = np.empty(total_latents, dtype=np.int32)
+
+    image_global_start = 0
+    latent_output_start = 0
+    for sample_ordinal, path in enumerate(capture_paths):
+        with np.load(path, allow_pickle=False) as data:
+            vectors = data["vectors"]
+            if vectors.ndim != 2 or vectors.shape[1] != hidden_size:
+                raise RuntimeError(
+                    f"Capture hidden size mismatch in {path}: "
+                    f"{vectors.shape} versus (*, {hidden_size})"
+                )
+            kind_codes = data["kind_codes"]
+            image_rows = np.flatnonzero(kind_codes == 1)
+            latent_rows = np.flatnonzero(kind_codes == 2)
+
+            image_global_end = image_global_start + len(image_rows)
+            chosen_start = np.searchsorted(
+                chosen_images, image_global_start, side="left"
+            )
+            chosen_end = np.searchsorted(
+                chosen_images, image_global_end, side="left"
+            )
+            if chosen_end > chosen_start:
+                local_image_ordinals = (
+                    chosen_images[chosen_start:chosen_end] - image_global_start
+                )
+                selected_rows = image_rows[local_image_ordinals]
+                image_vectors[chosen_start:chosen_end] = vectors[selected_rows]
+                image_sample_ordinals[chosen_start:chosen_end] = sample_ordinal
+                image_sequence_positions[chosen_start:chosen_end] = data[
+                    "sequence_positions"
+                ][selected_rows]
+                image_generation_steps[chosen_start:chosen_end] = data[
+                    "generation_steps"
+                ][selected_rows]
+            image_global_start = image_global_end
+
+            latent_output_end = latent_output_start + len(latent_rows)
+            if len(latent_rows):
+                order = np.argsort(
+                    data["sequence_positions"][latent_rows], kind="stable"
+                )
+                latent_rows = latent_rows[order]
+                output_slice = slice(latent_output_start, latent_output_end)
+                latent_vectors[output_slice] = vectors[latent_rows]
+                latent_sample_ordinals[output_slice] = sample_ordinal
+                latent_sequence_positions[output_slice] = data[
+                    "sequence_positions"
+                ][latent_rows]
+                latent_generation_steps[output_slice] = data[
+                    "generation_steps"
+                ][latent_rows]
+                latent_indices[output_slice] = data["latent_indices"][latent_rows]
+                latent_trajectory_steps[output_slice] = np.arange(
+                    len(latent_rows), dtype=np.int32
+                )
+            latent_output_start = latent_output_end
+
+            prompt_length = int(data["prompt_length"].item())
+            consumed_count = int(data["consumed_output_token_count"].item())
+            sampled_ids = sample_records[sample_ordinal]["output_token_ids"]
+            sample_records[sample_ordinal]["capture_counts"] = {
+                "image_feature": int(len(image_rows)),
+                "latent": int(len(latent_rows)),
+            }
+            sample_records[sample_ordinal]["prompt_token_count"] = prompt_length
+            sample_records[sample_ordinal][
+                "consumed_output_token_count"
+            ] = consumed_count
+            sample_records[sample_ordinal][
+                "unconsumed_output_token_ids"
+            ] = sampled_ids[consumed_count:]
+
+    image_vectors.flush()
+    latent_offsets = np.concatenate((
+        np.asarray([0], dtype=np.int64),
+        np.cumsum(latent_counts, dtype=np.int64),
+    ))
+    metadata = {
+        "image_sample_ordinal": image_sample_ordinals,
+        "image_sequence_positions": image_sequence_positions,
+        "image_generation_steps": image_generation_steps,
+        "latent_sample_ordinal": latent_sample_ordinals,
+        "latent_sequence_positions": latent_sequence_positions,
+        "latent_generation_steps": latent_generation_steps,
+        "latent_indices": latent_indices,
+        "latent_trajectory_steps": latent_trajectory_steps,
+        "latent_sample_offsets": latent_offsets,
+    }
+    statistics = {
+        "available_image_features": total_images,
+        "sampled_image_features": target_image_count,
+        "image_sampling_with_replacement": used_replacement,
+        "latent_vectors": total_latents,
+        "per_sample_image_counts": image_counts.tolist(),
+        "per_sample_latent_counts": latent_counts.tolist(),
+    }
+    return image_vectors, latent_vectors, metadata, statistics
+
+
+def _copy_float32_blocks(destination, start: int, source: np.ndarray) -> int:
+    for source_start in range(0, len(source), PCA_TRANSFORM_BATCH_SIZE):
+        source_end = min(
+            source_start + PCA_TRANSFORM_BATCH_SIZE, len(source)
+        )
+        count = source_end - source_start
+        destination[start:start + count] = source[source_start:source_end]
+        start += count
+    return start
+
+
+def _project_vectors(pca: PCA, vectors: np.ndarray) -> np.ndarray:
+    coordinates = np.empty((len(vectors), 3), dtype=np.float32)
+    for start in range(0, len(vectors), PCA_TRANSFORM_BATCH_SIZE):
+        end = min(start + PCA_TRANSFORM_BATCH_SIZE, len(vectors))
+        coordinates[start:end] = pca.transform(
+            vectors[start:end].astype(np.float32, copy=False)
+        )
+    return coordinates
+
+
+def fit_and_project_joint_pca(
+    vocabulary_vectors: np.ndarray,
+    image_vectors: np.ndarray,
+    latent_vectors: np.ndarray,
+    temporary_dir: Path,
+) -> tuple[PCA, list[np.ndarray]]:
+    vector_sources = [vocabulary_vectors, image_vectors, latent_vectors]
+    hidden_sizes = {vectors.shape[1] for vectors in vector_sources}
+    if len(hidden_sizes) != 1:
+        raise ValueError(f"Embedding hidden sizes do not match: {hidden_sizes}")
+    total_points = sum(len(vectors) for vectors in vector_sources)
+    if total_points < 3:
+        raise ValueError("Fewer than three vectors are available for PCA.")
+
+    fit_path = temporary_dir / "joint_pca_fit.float32.mmap"
+    fit_matrix = np.memmap(
+        fit_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_points, hidden_sizes.pop()),
+    )
+    try:
+        destination_start = 0
+        for vectors in vector_sources:
+            destination_start = _copy_float32_blocks(
+                fit_matrix, destination_start, vectors
+            )
+        fit_matrix.flush()
+        pca = PCA(
+            n_components=3,
+            svd_solver="randomized",
+            random_state=RANDOM_SEED,
+            copy=False,
+        )
+        pca.fit(fit_matrix)
+    finally:
+        del fit_matrix
+        gc.collect()
+        if fit_path.exists():
+            fit_path.unlink()
+
+    projected = [
+        _project_vectors(pca, vectors) for vectors in vector_sources
+    ]
+    return pca, projected
+
+
+def assemble_joint_points(
+    projected: list[np.ndarray], metadata: dict[str, np.ndarray]
 ) -> dict[str, np.ndarray]:
-    fields: dict[str, list[np.ndarray]] = {
-        "coordinates": [],
-        "sample_ordinal": [],
-        "kind_codes": [],
-        "token_ids": [],
-        "sequence_positions": [],
-        "generation_steps": [],
-        "latent_indices": [],
-        "image_feature_indices": [],
-        "trajectory_steps": [],
-        "token_labels": [],
-    }
-    for sample_ordinal, (capture, coordinates) in enumerate(
-        zip(captures, projected)
-    ):
-        kind_codes = capture["kind_codes"].astype(np.uint8, copy=False)
-        token_ids = capture["token_ids"].astype(np.int32, copy=False)
-        labels = []
-        image_feature_indices = np.full(
-            len(coordinates), -1, dtype=np.int32
-        )
-        image_index = 0
-        for point_index, (kind_code, token_id, latent_index) in enumerate(zip(
-            kind_codes, token_ids, capture["latent_indices"]
-        )):
-            kind_name = KIND_NAMES[int(kind_code)]
-            if kind_name == "image_feature":
-                labels.append("")
-                image_feature_indices[point_index] = image_index
-                image_index += 1
-            elif kind_name == "latent":
-                labels.append(f"latent_{int(latent_index)}")
-            else:
-                labels.append(decode_token(tokenizer, int(token_id)))
-
-        trajectory_steps = np.full(len(coordinates), -1, dtype=np.int32)
-        trajectory_indices = np.flatnonzero(kind_codes != 1)
-        trajectory_indices = trajectory_indices[np.argsort(
-            capture["sequence_positions"][trajectory_indices], kind="stable"
-        )]
-        trajectory_steps[trajectory_indices] = np.arange(
-            len(trajectory_indices), dtype=np.int32
-        )
-
-        fields["coordinates"].append(coordinates)
-        fields["sample_ordinal"].append(
-            np.full(len(coordinates), sample_ordinal, dtype=np.int32)
-        )
-        fields["kind_codes"].append(kind_codes)
-        fields["token_ids"].append(token_ids)
-        fields["sequence_positions"].append(capture["sequence_positions"])
-        fields["generation_steps"].append(capture["generation_steps"])
-        fields["latent_indices"].append(capture["latent_indices"])
-        fields["image_feature_indices"].append(image_feature_indices)
-        fields["trajectory_steps"].append(trajectory_steps)
-        fields["token_labels"].append(np.asarray(labels, dtype=np.str_))
-
-        counts = np.bincount(kind_codes, minlength=len(KIND_NAMES))
-        sample_records[sample_ordinal]["capture_counts"] = {
-            name: int(counts[index]) for index, name in enumerate(KIND_NAMES)
-        }
-        prompt_length = int(capture["prompt_length"].item())
-        consumed_generation_steps = capture["generation_steps"][
-            capture["generation_steps"] >= 0
-        ]
-        consumed_count = (
-            int(consumed_generation_steps.max()) + 1
-            if consumed_generation_steps.size else 0
-        )
-        sampled_ids = sample_records[sample_ordinal]["output_token_ids"]
-        sample_records[sample_ordinal]["prompt_token_count"] = prompt_length
-        sample_records[sample_ordinal]["consumed_output_token_count"] = consumed_count
-        sample_records[sample_ordinal]["unconsumed_output_token_ids"] = sampled_ids[
-            consumed_count:
-        ]
-
+    vocabulary_coordinates, image_coordinates, latent_coordinates = projected
+    vocabulary_count = len(vocabulary_coordinates)
+    image_count = len(image_coordinates)
+    latent_count = len(latent_coordinates)
     return {
-        key: np.concatenate(values, axis=0) for key, values in fields.items()
+        "coordinates": np.concatenate(projected, axis=0),
+        "kind_codes": np.concatenate((
+            np.zeros(vocabulary_count, dtype=np.uint8),
+            np.ones(image_count, dtype=np.uint8),
+            np.full(latent_count, 2, dtype=np.uint8),
+        )),
+        "token_ids": np.concatenate((
+            np.arange(vocabulary_count, dtype=np.int32),
+            np.full(image_count + latent_count, -1, dtype=np.int32),
+        )),
+        "sample_ordinal": np.concatenate((
+            np.full(vocabulary_count, -1, dtype=np.int32),
+            metadata["image_sample_ordinal"],
+            metadata["latent_sample_ordinal"],
+        )),
+        "sequence_positions": np.concatenate((
+            np.full(vocabulary_count, -1, dtype=np.int32),
+            metadata["image_sequence_positions"],
+            metadata["latent_sequence_positions"],
+        )),
+        "generation_steps": np.concatenate((
+            np.full(vocabulary_count, -1, dtype=np.int32),
+            metadata["image_generation_steps"],
+            metadata["latent_generation_steps"],
+        )),
+        "latent_indices": np.concatenate((
+            np.full(vocabulary_count + image_count, -1, dtype=np.int32),
+            metadata["latent_indices"],
+        )),
+        "trajectory_steps": np.concatenate((
+            np.full(vocabulary_count + image_count, -1, dtype=np.int32),
+            metadata["latent_trajectory_steps"],
+        )),
     }
 
 
-def save_pca_archive(
+def save_pca_archives(
     output_path: Path,
     points: dict[str, np.ndarray],
+    latent_coordinates: np.ndarray,
+    metadata: dict[str, np.ndarray],
     pca: PCA,
     sample_records: list[dict[str, Any]],
 ) -> None:
+    dataset_indices = np.asarray(
+        [str(record["dataset_index"]) for record in sample_records],
+        dtype=np.str_,
+    )
+    request_ids = np.asarray(
+        [record["request_id"] for record in sample_records], dtype=np.str_
+    )
     np.savez_compressed(
-        output_path / "joint_pca_3d.npz",
+        output_path / JOINT_PCA_FILE,
         **points,
         kind_names=KIND_NAMES,
-        dataset_indices=np.asarray(
-            [str(record["dataset_index"]) for record in sample_records],
-            dtype=np.str_,
-        ),
-        request_ids=np.asarray(
-            [record["request_id"] for record in sample_records], dtype=np.str_
-        ),
+        dataset_indices=dataset_indices,
+        request_ids=request_ids,
         pca_components=pca.components_.astype(np.float32),
         pca_mean=pca.mean_.astype(np.float32),
         explained_variance=pca.explained_variance_.astype(np.float32),
         explained_variance_ratio=pca.explained_variance_ratio_.astype(np.float32),
     )
-
-
-VTP_POINT_ARRAYS = {
-    "sample_ordinal": "sample_ordinal",
-    "kind_codes": "kind_code",
-    "token_ids": "token_id",
-    "sequence_positions": "sequence_position",
-    "generation_steps": "generation_step",
-    "latent_indices": "latent_index",
-    "image_feature_indices": "image_feature_index",
-    "trajectory_steps": "trajectory_step",
-}
-
-
-def _vtk_numeric_array(values: np.ndarray, name: str):
-    from vtkmodules.util.numpy_support import numpy_to_vtk
-
-    vtk_array = numpy_to_vtk(np.ascontiguousarray(values), deep=True)
-    vtk_array.SetName(name)
-    return vtk_array
-
-
-def _vtk_string_array(values: Iterable[Any], name: str):
-    from vtkmodules.vtkCommonCore import vtkStringArray
-
-    vtk_array = vtkStringArray()
-    vtk_array.SetName(name)
-    for value in values:
-        vtk_array.InsertNextValue(str(value))
-    return vtk_array
-
-
-def _vtk_cell_array(offsets: np.ndarray, connectivity: np.ndarray):
-    from vtkmodules.vtkCommonDataModel import vtkCellArray
-    from vtkmodules.util.numpy_support import numpy_to_vtkIdTypeArray
-
-    cells = vtkCellArray()
-    cells.SetData(
-        numpy_to_vtkIdTypeArray(
-            np.ascontiguousarray(offsets, dtype=np.int64), deep=True
-        ),
-        numpy_to_vtkIdTypeArray(
-            np.ascontiguousarray(connectivity, dtype=np.int64), deep=True
-        ),
+    np.savez_compressed(
+        output_path / LATENT_TRAJECTORY_FILE,
+        coordinates=latent_coordinates,
+        sample_ordinal=metadata["latent_sample_ordinal"],
+        sequence_positions=metadata["latent_sequence_positions"],
+        generation_steps=metadata["latent_generation_steps"],
+        latent_indices=metadata["latent_indices"],
+        trajectory_steps=metadata["latent_trajectory_steps"],
+        sample_offsets=metadata["latent_sample_offsets"],
+        dataset_indices=dataset_indices,
+        request_ids=request_ids,
     )
-    return cells
-
-
-def _add_vtp_point_data(polydata, points: dict[str, np.ndarray]) -> None:
-    point_data = polydata.GetPointData()
-    for source_name, output_name in VTP_POINT_ARRAYS.items():
-        point_data.AddArray(_vtk_numeric_array(points[source_name], output_name))
-    point_data.AddArray(_vtk_string_array(points["token_labels"], "token_label"))
-
-
-def _add_vtp_field_data(
-    polydata,
-    sample_records: list[dict[str, Any]],
-    explained_variance_ratio: np.ndarray,
-) -> None:
-    field_data = polydata.GetFieldData()
-    field_data.AddArray(_vtk_string_array(KIND_NAMES, "kind_names"))
-    field_data.AddArray(_vtk_string_array(
-        (record["dataset_index"] for record in sample_records),
-        "dataset_indices",
-    ))
-    field_data.AddArray(_vtk_string_array(
-        (record["request_id"] for record in sample_records),
-        "request_ids",
-    ))
-    field_data.AddArray(_vtk_numeric_array(
-        np.asarray(explained_variance_ratio, dtype=np.float32),
-        "pca_explained_variance_ratio",
-    ))
-
-
-def _new_vtp_polydata(coordinates: np.ndarray):
-    from vtkmodules.vtkCommonCore import vtkPoints
-    from vtkmodules.vtkCommonDataModel import vtkPolyData
-
-    vtk_points = vtkPoints()
-    vtk_points.SetData(_vtk_numeric_array(
-        np.asarray(coordinates, dtype=np.float32), "PCA_coordinates"
-    ))
-    polydata = vtkPolyData()
-    polydata.SetPoints(vtk_points)
-    return polydata
-
-
-def _write_compressed_vtp(path: Path, polydata) -> None:
-    from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter
-
-    temporary_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
-    writer = vtkXMLPolyDataWriter()
-    writer.SetFileName(str(temporary_path))
-    writer.SetInputData(polydata)
-    writer.SetDataModeToAppended()
-    writer.EncodeAppendedDataOff()
-    writer.SetCompressorTypeToZLib()
-    writer.SetCompressionLevel(VTP_COMPRESSION_LEVEL)
-    try:
-        if writer.Write() != 1 or not temporary_path.is_file():
-            raise RuntimeError(f"VTK failed to write PolyData: {path}")
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-
-def build_vtp_outputs(
-    output_path: Path,
-    points: dict[str, np.ndarray],
-    sample_records: list[dict[str, Any]],
-    explained_variance_ratio: np.ndarray,
-) -> dict[str, int]:
-    coordinates = points["coordinates"]
-    point_count = len(coordinates)
-
-    point_cloud = _new_vtp_polydata(coordinates)
-    point_cloud.SetVerts(_vtk_cell_array(
-        np.arange(point_count + 1, dtype=np.int64),
-        np.arange(point_count, dtype=np.int64),
-    ))
-    _add_vtp_point_data(point_cloud, points)
-    _add_vtp_field_data(
-        point_cloud, sample_records, explained_variance_ratio
-    )
-
-    trajectory_index_blocks = []
-    line_connectivity_blocks = []
-    line_sample_blocks = []
-    line_step_blocks = []
-    trajectory_point_offset = 0
-    for sample_ordinal in range(len(sample_records)):
-        indices = np.flatnonzero(
-            (points["sample_ordinal"] == sample_ordinal)
-            & (points["kind_codes"] != 1)
-        )
-        indices = indices[np.argsort(
-            points["sequence_positions"][indices], kind="stable"
-        )]
-        trajectory_index_blocks.append(indices)
-        if len(indices) > 1:
-            local_indices = np.arange(
-                trajectory_point_offset,
-                trajectory_point_offset + len(indices),
-                dtype=np.int64,
-            )
-            line_connectivity_blocks.append(np.column_stack((
-                local_indices[:-1], local_indices[1:]
-            )).reshape(-1))
-            line_sample_blocks.append(np.full(
-                len(indices) - 1, sample_ordinal, dtype=np.int32
-            ))
-            line_step_blocks.append(np.arange(
-                1, len(indices), dtype=np.int32
-            ))
-        trajectory_point_offset += len(indices)
-
-    trajectory_indices = (
-        np.concatenate(trajectory_index_blocks)
-        if trajectory_index_blocks else np.empty(0, dtype=np.int64)
-    )
-    trajectory_points = {
-        name: values[trajectory_indices] for name, values in points.items()
-    }
-    line_connectivity = (
-        np.concatenate(line_connectivity_blocks)
-        if line_connectivity_blocks else np.empty(0, dtype=np.int64)
-    )
-    line_samples = (
-        np.concatenate(line_sample_blocks)
-        if line_sample_blocks else np.empty(0, dtype=np.int32)
-    )
-    line_steps = (
-        np.concatenate(line_step_blocks)
-        if line_step_blocks else np.empty(0, dtype=np.int32)
-    )
-    line_count = len(line_steps)
-
-    trajectories = _new_vtp_polydata(trajectory_points["coordinates"])
-    trajectories.SetLines(_vtk_cell_array(
-        np.arange(0, 2 * line_count + 1, 2, dtype=np.int64),
-        line_connectivity,
-    ))
-    _add_vtp_point_data(trajectories, trajectory_points)
-    trajectories.GetCellData().AddArray(
-        _vtk_numeric_array(line_samples, "sample_ordinal")
-    )
-    trajectories.GetCellData().AddArray(
-        _vtk_numeric_array(line_steps, "trajectory_step")
-    )
-    _add_vtp_field_data(
-        trajectories, sample_records, explained_variance_ratio
-    )
-
-    _write_compressed_vtp(output_path / POINT_CLOUD_VTP_FILE, point_cloud)
-    _write_compressed_vtp(output_path / TRAJECTORY_VTP_FILE, trajectories)
-    return {
-        "point_cloud_points": point_count,
-        "point_cloud_vertex_cells": point_count,
-        "trajectory_points": len(trajectory_indices),
-        "trajectory_line_segments": line_count,
-    }
 
 
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
@@ -914,15 +873,14 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 def global_config_snapshot() -> dict[str, Any]:
     names = [
         "MODEL_PATH", "HRBENCH_DIR", "HRBENCH_FILE", "OUTPUT_DIR",
-        "POINT_CLOUD_VTP_FILE", "TRAJECTORY_VTP_FILE",
+        "JOINT_PCA_FILE", "LATENT_TRAJECTORY_FILE",
         "SELECTION_MODE", "START_INDEX", "NUM_SAMPLES", "RANDOM_SEED",
         "LATENT_SIZE", "TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION",
         "MAX_MODEL_LEN", "MAX_NUM_SEQS", "MAX_OUTPUT_TOKENS",
         "SWAP_SPACE_GB", "DTYPE", "ENABLE_CHUNKED_PREFILL",
         "ENABLE_SLEEP_MODE", "MIN_PIXELS", "MAX_PIXELS", "TEMPERATURE",
         "TOP_K", "TOP_P", "REPETITION_PENALTY", "BEST_OF", "STOP",
-        "PCA_FIT_POINTS_PER_KIND", "PCA_TRANSFORM_BATCH_SIZE",
-        "VTP_COMPRESSION_LEVEL",
+        "VOCAB_EMBEDDING_BATCH_SIZE", "PCA_TRANSFORM_BATCH_SIZE",
     ]
     return {name: globals()[name] for name in names}
 
@@ -933,7 +891,7 @@ def main() -> None:
     capture_dir = Path(tempfile.mkdtemp(prefix=".monet_capture_", dir=output_path))
     succeeded = False
     try:
-        outputs, processor, worker_statuses = run_inference(
+        outputs, worker_statuses, vocabulary_export = run_inference(
             model_path, rows, dataset_path.parent, capture_dir
         )
         if len(outputs) != len(rows):
@@ -969,54 +927,69 @@ def main() -> None:
         capture_paths = wait_for_captures(
             capture_dir, request_ids, worker_statuses
         )
-        captures = [load_capture(capture_paths[request_id])
-                    for request_id in request_ids]
-        pca, projected, available_counts = balanced_pca(captures)
-        points = assemble_points(
-            captures, projected, sample_records, processor.tokenizer
+        ordered_capture_paths = [
+            capture_paths[request_id] for request_id in request_ids
+        ]
+        vocabulary_vectors = np.load(
+            Path(vocabulary_export["path"]), mmap_mode="r"
         )
-        del captures, projected
+        image_vectors, latent_vectors, metadata, capture_statistics = (
+            extract_image_and_latent_vectors(
+                ordered_capture_paths,
+                sample_records,
+                target_image_count=len(vocabulary_vectors),
+                hidden_size=int(vocabulary_vectors.shape[1]),
+                temporary_dir=capture_dir,
+            )
+        )
+        pca, projected = fit_and_project_joint_pca(
+            vocabulary_vectors,
+            image_vectors,
+            latent_vectors,
+            capture_dir,
+        )
+        points = assemble_joint_points(projected, metadata)
+        save_pca_archives(
+            output_path,
+            points,
+            projected[2],
+            metadata,
+            pca,
+            sample_records,
+        )
+        del vocabulary_vectors, image_vectors, latent_vectors, projected
         gc.collect()
-        save_pca_archive(output_path, points, pca, sample_records)
         write_jsonl(output_path / "results.jsonl", sample_records)
-        vtp_statistics = build_vtp_outputs(
-            output_path, points, sample_records, pca.explained_variance_ratio_
-        )
 
         run_config = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "config": global_config_snapshot(),
             "vllm_enable_v1_multiprocessing": False,
             "validated_worker_statuses": worker_statuses,
+            "vocabulary_export": {
+                key: value
+                for key, value in vocabulary_export.items()
+                if key != "path"
+            },
             "selected_dataset_ordinals": selected_indices,
-            "pca_available_counts": available_counts,
-            "pca_balanced_fit_points_per_nonempty_kind": PCA_FIT_POINTS_PER_KIND,
+            "capture_statistics": capture_statistics,
+            "pca_input_counts": {
+                "vocabulary_embedding": int(vocabulary_export["vocab_size"]),
+                "image_feature": capture_statistics["sampled_image_features"],
+                "latent": capture_statistics["latent_vectors"],
+            },
             "pca_explained_variance_ratio":
                 pca.explained_variance_ratio_.tolist(),
             "total_projected_points": int(len(points["coordinates"])),
-            "vtp_outputs": {
-                "point_cloud": POINT_CLOUD_VTP_FILE,
-                "trajectories": TRAJECTORY_VTP_FILE,
-                "compression": "appended binary with zlib",
-                "compression_level": VTP_COMPRESSION_LEVEL,
-                **vtp_statistics,
-            },
-            "paraview_filters": {
-                "sample_selection": (
-                    "Threshold Cell Data sample_ordinal to the selected sample"
-                ),
-                "trajectory_prefix": (
-                    "Threshold Cell Data trajectory_step from 0 through k"
-                ),
-                "current_token": (
-                    "Threshold Point Data sample_ordinal, then Point Data "
-                    "trajectory_step exactly to k on the point cloud"
-                ),
+            "outputs": {
+                "joint_pca": JOINT_PCA_FILE,
+                "latent_trajectories": LATENT_TRAJECTORY_FILE,
+                "results": "results.jsonl",
             },
             "note": (
-                "Trajectory lines connect actual consumed input vectors in "
-                "sequence order; image features are excluded from lines, "
-                "and the lines are not attention paths."
+                "Each sample's latent vectors are ordered by actual consumed "
+                "sequence position and form one trajectory, including across "
+                "intervening text tokens; trajectories are not attention paths."
             ),
         }
         (output_path / "run_config.json").write_text(
@@ -1025,8 +998,8 @@ def main() -> None:
         )
         succeeded = True
         print(f"Analysis complete: {output_path}")
-        print(f"ParaView point cloud: {output_path / POINT_CLOUD_VTP_FILE}")
-        print(f"ParaView trajectories: {output_path / TRAJECTORY_VTP_FILE}")
+        print(f"Joint PCA: {output_path / JOINT_PCA_FILE}")
+        print(f"Latent trajectories: {output_path / LATENT_TRAJECTORY_FILE}")
     finally:
         os.environ.pop("MONET_ANALYSIS_CAPTURE_DIR", None)
         os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
