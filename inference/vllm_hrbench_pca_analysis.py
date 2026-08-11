@@ -1,4 +1,4 @@
-"""Run Monet on local HR-Bench 4K data and visualize internal vectors.
+"""Run Monet on local HR-Bench 4K data and export internal vectors.
 
 Edit the global variables in the configuration section below, then run:
 
@@ -27,8 +27,6 @@ from pathlib import Path
 from typing import Any, Iterable
 sys.path.insert(0, '/home/fit/renjujty/WORK/jty/Monet/')
 import numpy as np
-import plotly.graph_objects as go
-import plotly.io as pio
 from PIL import Image
 from sklearn.decomposition import PCA
 
@@ -41,6 +39,8 @@ MODEL_PATH = "/home/fit/renjujty/WORK/jty/lmllms/monet/"
 HRBENCH_DIR = "/home/fit/renjujty/WORK/jty/lmllms/hrbench/"
 HRBENCH_FILE = "hr_bench_4k.parquet"
 OUTPUT_DIR = "outputs/hrbench_pca"
+POINT_CLOUD_VTP_FILE = "hrbench_point_cloud.vtp"
+TRAJECTORY_VTP_FILE = "hrbench_trajectories.vtp"
 
 # "sequential": START_INDEX ... START_INDEX + NUM_SAMPLES
 # "random": deterministic sampling without replacement using RANDOM_SEED
@@ -75,10 +75,7 @@ STOP = None
 PCA_FIT_POINTS_PER_KIND = 2048
 PCA_TRANSFORM_BATCH_SIZE = 8192
 
-POINT_SIZE = 2.3
-TRAJECTORY_POINT_SIZE = 4.5
-CURRENT_POINT_SIZE = 9.0
-ANIMATION_INTERVAL_MS = 120
+VTP_COMPRESSION_LEVEL = 6
 CAPTURE_WAIT_SECONDS = 5
 KEEP_TEMP_CAPTURE_ON_ERROR = False
 
@@ -86,12 +83,6 @@ KEEP_TEMP_CAPTURE_ON_ERROR = False
 KIND_NAMES = np.asarray(
     ["prompt_text", "image_feature", "latent", "response_text"]
 )
-KIND_COLORS = {
-    "prompt_text": "#3B82F6",
-    "image_feature": "#94A3B8",
-    "latent": "#F97316",
-    "response_text": "#22C55E",
-}
 REQUIRED_COLUMNS = {
     "index", "question", "answer", "category", "A", "B", "C", "D",
     "cycle_category", "image",
@@ -236,6 +227,16 @@ def validate_configuration() -> tuple[Path, Path, Path]:
         raise ValueError("LATENT_SIZE must be positive.")
     if PCA_FIT_POINTS_PER_KIND <= 0 or PCA_TRANSFORM_BATCH_SIZE <= 0:
         raise ValueError("PCA point and batch sizes must be positive.")
+    if not 1 <= VTP_COMPRESSION_LEVEL <= 9:
+        raise ValueError("VTP_COMPRESSION_LEVEL must be between 1 and 9.")
+    try:
+        from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter  # noqa: F401
+        from vtkmodules.util.numpy_support import numpy_to_vtk  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "ParaView VTP export requires the 'vtk' package. Install the "
+            "updated requirements.txt before starting inference."
+        ) from exc
 
     model_path = Path(MODEL_PATH).expanduser()
     dataset_path = Path(HRBENCH_DIR).expanduser() / HRBENCH_FILE
@@ -603,6 +604,8 @@ def assemble_points(
         "sequence_positions": [],
         "generation_steps": [],
         "latent_indices": [],
+        "image_feature_indices": [],
+        "trajectory_steps": [],
         "token_labels": [],
     }
     for sample_ordinal, (capture, coordinates) in enumerate(
@@ -611,18 +614,31 @@ def assemble_points(
         kind_codes = capture["kind_codes"].astype(np.uint8, copy=False)
         token_ids = capture["token_ids"].astype(np.int32, copy=False)
         labels = []
+        image_feature_indices = np.full(
+            len(coordinates), -1, dtype=np.int32
+        )
         image_index = 0
-        for kind_code, token_id, latent_index in zip(
+        for point_index, (kind_code, token_id, latent_index) in enumerate(zip(
             kind_codes, token_ids, capture["latent_indices"]
-        ):
+        )):
             kind_name = KIND_NAMES[int(kind_code)]
             if kind_name == "image_feature":
-                labels.append(f"image_feature_{image_index}")
+                labels.append("")
+                image_feature_indices[point_index] = image_index
                 image_index += 1
             elif kind_name == "latent":
                 labels.append(f"latent_{int(latent_index)}")
             else:
                 labels.append(decode_token(tokenizer, int(token_id)))
+
+        trajectory_steps = np.full(len(coordinates), -1, dtype=np.int32)
+        trajectory_indices = np.flatnonzero(kind_codes != 1)
+        trajectory_indices = trajectory_indices[np.argsort(
+            capture["sequence_positions"][trajectory_indices], kind="stable"
+        )]
+        trajectory_steps[trajectory_indices] = np.arange(
+            len(trajectory_indices), dtype=np.int32
+        )
 
         fields["coordinates"].append(coordinates)
         fields["sample_ordinal"].append(
@@ -633,6 +649,8 @@ def assemble_points(
         fields["sequence_positions"].append(capture["sequence_positions"])
         fields["generation_steps"].append(capture["generation_steps"])
         fields["latent_indices"].append(capture["latent_indices"])
+        fields["image_feature_indices"].append(image_feature_indices)
+        fields["trajectory_steps"].append(trajectory_steps)
         fields["token_labels"].append(np.asarray(labels, dtype=np.str_))
 
         counts = np.bincount(kind_codes, minlength=len(KIND_NAMES))
@@ -683,114 +701,138 @@ def save_pca_archive(
     )
 
 
-def point_customdata(
-    points: dict[str, np.ndarray], indices: np.ndarray, sample_records
-) -> list[list[Any]]:
-    rows = []
-    for index in indices:
-        sample = int(points["sample_ordinal"][index])
-        kind_code = int(points["kind_codes"][index])
-        rows.append([
-            str(sample_records[sample]["dataset_index"]),
-            str(KIND_NAMES[kind_code]),
-            str(points["token_labels"][index]),
-            int(points["token_ids"][index]),
-            int(points["sequence_positions"][index]),
-            int(points["generation_steps"][index]),
-            int(points["latent_indices"][index]),
-            sample,
-        ])
-    return rows
+VTP_POINT_ARRAYS = {
+    "sample_ordinal": "sample_ordinal",
+    "kind_codes": "kind_code",
+    "token_ids": "token_id",
+    "sequence_positions": "sequence_position",
+    "generation_steps": "generation_step",
+    "latent_indices": "latent_index",
+    "image_feature_indices": "image_feature_index",
+    "trajectory_steps": "trajectory_step",
+}
 
 
-def build_html(
+def _vtk_numeric_array(values: np.ndarray, name: str):
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+
+    vtk_array = numpy_to_vtk(np.ascontiguousarray(values), deep=True)
+    vtk_array.SetName(name)
+    return vtk_array
+
+
+def _vtk_string_array(values: Iterable[Any], name: str):
+    from vtkmodules.vtkCommonCore import vtkStringArray
+
+    vtk_array = vtkStringArray()
+    vtk_array.SetName(name)
+    for value in values:
+        vtk_array.InsertNextValue(str(value))
+    return vtk_array
+
+
+def _vtk_cell_array(offsets: np.ndarray, connectivity: np.ndarray):
+    from vtkmodules.vtkCommonDataModel import vtkCellArray
+    from vtkmodules.util.numpy_support import numpy_to_vtkIdTypeArray
+
+    cells = vtkCellArray()
+    cells.SetData(
+        numpy_to_vtkIdTypeArray(
+            np.ascontiguousarray(offsets, dtype=np.int64), deep=True
+        ),
+        numpy_to_vtkIdTypeArray(
+            np.ascontiguousarray(connectivity, dtype=np.int64), deep=True
+        ),
+    )
+    return cells
+
+
+def _add_vtp_point_data(polydata, points: dict[str, np.ndarray]) -> None:
+    point_data = polydata.GetPointData()
+    for source_name, output_name in VTP_POINT_ARRAYS.items():
+        point_data.AddArray(_vtk_numeric_array(points[source_name], output_name))
+    point_data.AddArray(_vtk_string_array(points["token_labels"], "token_label"))
+
+
+def _add_vtp_field_data(
+    polydata,
+    sample_records: list[dict[str, Any]],
+    explained_variance_ratio: np.ndarray,
+) -> None:
+    field_data = polydata.GetFieldData()
+    field_data.AddArray(_vtk_string_array(KIND_NAMES, "kind_names"))
+    field_data.AddArray(_vtk_string_array(
+        (record["dataset_index"] for record in sample_records),
+        "dataset_indices",
+    ))
+    field_data.AddArray(_vtk_string_array(
+        (record["request_id"] for record in sample_records),
+        "request_ids",
+    ))
+    field_data.AddArray(_vtk_numeric_array(
+        np.asarray(explained_variance_ratio, dtype=np.float32),
+        "pca_explained_variance_ratio",
+    ))
+
+
+def _new_vtp_polydata(coordinates: np.ndarray):
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkPolyData
+
+    vtk_points = vtkPoints()
+    vtk_points.SetData(_vtk_numeric_array(
+        np.asarray(coordinates, dtype=np.float32), "PCA_coordinates"
+    ))
+    polydata = vtkPolyData()
+    polydata.SetPoints(vtk_points)
+    return polydata
+
+
+def _write_compressed_vtp(path: Path, polydata) -> None:
+    from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter
+
+    temporary_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    writer = vtkXMLPolyDataWriter()
+    writer.SetFileName(str(temporary_path))
+    writer.SetInputData(polydata)
+    writer.SetDataModeToAppended()
+    writer.EncodeAppendedDataOff()
+    writer.SetCompressorTypeToZLib()
+    writer.SetCompressionLevel(VTP_COMPRESSION_LEVEL)
+    try:
+        if writer.Write() != 1 or not temporary_path.is_file():
+            raise RuntimeError(f"VTK failed to write PolyData: {path}")
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def build_vtp_outputs(
     output_path: Path,
     points: dict[str, np.ndarray],
     sample_records: list[dict[str, Any]],
     explained_variance_ratio: np.ndarray,
-) -> None:
-    figure = go.Figure()
+) -> dict[str, int]:
     coordinates = points["coordinates"]
-    cloud_trace_indices = []
-    cloud_trace_samples = []
-    legend_kinds = set()
+    point_count = len(coordinates)
+
+    point_cloud = _new_vtp_polydata(coordinates)
+    point_cloud.SetVerts(_vtk_cell_array(
+        np.arange(point_count + 1, dtype=np.int64),
+        np.arange(point_count, dtype=np.int64),
+    ))
+    _add_vtp_point_data(point_cloud, points)
+    _add_vtp_field_data(
+        point_cloud, sample_records, explained_variance_ratio
+    )
+
+    trajectory_index_blocks = []
+    line_connectivity_blocks = []
+    line_sample_blocks = []
+    line_step_blocks = []
+    trajectory_point_offset = 0
     for sample_ordinal in range(len(sample_records)):
-        sample_mask = points["sample_ordinal"] == sample_ordinal
-        for kind_code, kind_name in enumerate(KIND_NAMES.tolist()):
-            indices = np.flatnonzero(
-                sample_mask & (points["kind_codes"] == kind_code)
-            )
-            if not indices.size:
-                continue
-            show_legend = kind_name not in legend_kinds
-            legend_kinds.add(kind_name)
-            cloud_trace_indices.append(len(figure.data))
-            cloud_trace_samples.append(sample_ordinal)
-            figure.add_trace(go.Scatter3d(
-                x=coordinates[indices, 0],
-                y=coordinates[indices, 1],
-                z=coordinates[indices, 2],
-                mode="markers",
-                name=kind_name,
-                legendgroup=kind_name,
-                showlegend=show_legend,
-                customdata=point_customdata(points, indices, sample_records),
-                marker={
-                    "size": POINT_SIZE,
-                    "color": KIND_COLORS[kind_name],
-                    "opacity": 0.18 if kind_name == "image_feature" else 0.55,
-                },
-                hovertemplate=(
-                    "sample=%{customdata[0]}<br>kind=%{customdata[1]}<br>"
-                    "token=%{customdata[2]}<br>token_id=%{customdata[3]}<br>"
-                    "sequence_position=%{customdata[4]}<br>"
-                    "generation_step=%{customdata[5]}<br>"
-                    "latent_index=%{customdata[6]}<extra></extra>"
-                ),
-            ))
-
-    trajectory_trace_index = len(figure.data)
-    figure.add_trace(go.Scatter3d(
-        x=[], y=[], z=[], mode="lines+markers", name="selected trajectory",
-        line={"color": "#EAB308", "width": 6},
-        marker={"size": TRAJECTORY_POINT_SIZE, "color": "#FACC15"},
-        customdata=[],
-        hovertemplate=(
-            "step=%{customdata[0]}<br>kind=%{customdata[1]}<br>"
-            "token=%{customdata[2]}<br>token_id=%{customdata[3]}<br>"
-            "sequence_position=%{customdata[4]}<br>"
-            "generation_step=%{customdata[5]}<br>"
-            "latent_index=%{customdata[6]}<extra></extra>"
-        ),
-    ))
-    current_point_trace_index = len(figure.data)
-    figure.add_trace(go.Scatter3d(
-        x=[], y=[], z=[], mode="markers", name="current token",
-        marker={"size": CURRENT_POINT_SIZE, "color": "#EF4444",
-                "symbol": "diamond"},
-        customdata=[], hovertemplate="%{customdata}<extra>current</extra>",
-    ))
-
-    variance_text = ", ".join(
-        f"PC{i + 1}: {value:.2%}"
-        for i, value in enumerate(explained_variance_ratio)
-    )
-    figure.update_layout(
-        title=f"Monet HR-Bench joint PCA ({variance_text})",
-        template="plotly_dark",
-        height=850,
-        margin={"l": 0, "r": 0, "t": 70, "b": 0},
-        legend={"orientation": "h", "y": 1.02, "x": 0},
-        scene={
-            "xaxis_title": "PC1",
-            "yaxis_title": "PC2",
-            "zaxis_title": "PC3",
-        },
-        uirevision="keep-camera",
-    )
-
-    trajectory_data: dict[str, Any] = {}
-    for sample_ordinal, record in enumerate(sample_records):
         indices = np.flatnonzero(
             (points["sample_ordinal"] == sample_ordinal)
             & (points["kind_codes"] != 1)
@@ -798,143 +840,69 @@ def build_html(
         indices = indices[np.argsort(
             points["sequence_positions"][indices], kind="stable"
         )]
-        custom = []
-        for step, index in enumerate(indices):
-            custom.append([
-                step,
-                str(KIND_NAMES[int(points["kind_codes"][index])]),
-                str(points["token_labels"][index]),
-                int(points["token_ids"][index]),
-                int(points["sequence_positions"][index]),
-                int(points["generation_steps"][index]),
-                int(points["latent_indices"][index]),
-            ])
-        trajectory_data[str(sample_ordinal)] = {
-            "x": coordinates[indices, 0].tolist(),
-            "y": coordinates[indices, 1].tolist(),
-            "z": coordinates[indices, 2].tolist(),
-            "custom": custom,
-        }
+        trajectory_index_blocks.append(indices)
+        if len(indices) > 1:
+            local_indices = np.arange(
+                trajectory_point_offset,
+                trajectory_point_offset + len(indices),
+                dtype=np.int64,
+            )
+            line_connectivity_blocks.append(np.column_stack((
+                local_indices[:-1], local_indices[1:]
+            )).reshape(-1))
+            line_sample_blocks.append(np.full(
+                len(indices) - 1, sample_ordinal, dtype=np.int32
+            ))
+            line_step_blocks.append(np.arange(
+                1, len(indices), dtype=np.int32
+            ))
+        trajectory_point_offset += len(indices)
 
-    browser_records = []
-    for record in sample_records:
-        browser_records.append({
-            "dataset_index": str(record["dataset_index"]),
-            "category": str(record["category"]),
-            "question": str(record["question"]),
-            "answer": str(record["answer"]),
-            "cleaned_output_text": str(record["cleaned_output_text"]),
-            "capture_counts": record["capture_counts"],
-        })
-
-    trajectory_json = json.dumps(trajectory_data, ensure_ascii=False).replace(
-        "</", "<\\/"
+    trajectory_indices = (
+        np.concatenate(trajectory_index_blocks)
+        if trajectory_index_blocks else np.empty(0, dtype=np.int64)
     )
-    records_json = json.dumps(browser_records, ensure_ascii=False).replace(
-        "</", "<\\/"
+    trajectory_points = {
+        name: values[trajectory_indices] for name, values in points.items()
+    }
+    line_connectivity = (
+        np.concatenate(line_connectivity_blocks)
+        if line_connectivity_blocks else np.empty(0, dtype=np.int64)
     )
-    post_script = f"""
-const gd = document.getElementById('{{plot_id}}');
-const trajectoryData = {trajectory_json};
-const sampleRecords = {records_json};
-const cloudTraceIndices = {json.dumps(cloud_trace_indices)};
-const cloudTraceSamples = {json.dumps(cloud_trace_samples)};
-const trajectoryTraceIndex = {trajectory_trace_index};
-const currentPointTraceIndex = {current_point_trace_index};
-
-const controls = document.createElement('div');
-controls.style.cssText = 'font-family:Arial,sans-serif;background:#111827;color:#e5e7eb;padding:12px 16px;display:grid;grid-template-columns:minmax(220px,1fr) auto auto minmax(220px,2fr);gap:12px;align-items:center';
-controls.innerHTML = `
-  <label>样本 <select id="sample-select"></select></label>
-  <label><input id="all-cloud" type="checkbox" checked> 显示全部样本点云</label>
-  <button id="play-button" style="padding:6px 14px">播放</button>
-  <label>轨迹步 <input id="step-slider" type="range" min="1" value="1" style="width:75%"> <span id="step-label"></span></label>
-  <div id="sample-info" style="grid-column:1/-1;white-space:pre-wrap;line-height:1.4"></div>`;
-gd.parentNode.insertBefore(controls, gd);
-
-const select = controls.querySelector('#sample-select');
-const allCloud = controls.querySelector('#all-cloud');
-const playButton = controls.querySelector('#play-button');
-const slider = controls.querySelector('#step-slider');
-const stepLabel = controls.querySelector('#step-label');
-const info = controls.querySelector('#sample-info');
-let timer = null;
-
-sampleRecords.forEach((record, index) => {{
-  const option = document.createElement('option');
-  option.value = String(index);
-  option.textContent = `${{index}} | index=${{record.dataset_index}} | ${{record.category}}`;
-  select.appendChild(option);
-}});
-
-function filterCloud() {{
-  const selected = Number(select.value);
-  const visibility = cloudTraceSamples.map(sample =>
-    allCloud.checked || sample === selected
-  );
-  Plotly.restyle(gd, {{visible: visibility}}, cloudTraceIndices);
-}}
-
-function renderStep() {{
-  const data = trajectoryData[select.value];
-  const count = Math.min(Number(slider.value), data.x.length);
-  const current = Math.max(0, count - 1);
-  Plotly.restyle(gd, {{
-    x: [data.x.slice(0, count)], y: [data.y.slice(0, count)],
-    z: [data.z.slice(0, count)], customdata: [data.custom.slice(0, count)]
-  }}, [trajectoryTraceIndex]);
-  Plotly.restyle(gd, {{
-    x: [[data.x[current]]], y: [[data.y[current]]], z: [[data.z[current]]],
-    customdata: [[JSON.stringify(data.custom[current])]]
-  }}, [currentPointTraceIndex]);
-  const currentData = data.custom[current];
-  stepLabel.textContent = `${{count}} / ${{data.x.length}} | ${{currentData ? currentData[1] + ': ' + JSON.stringify(currentData[2]) : ''}}`;
-}}
-
-function stopPlaying() {{
-  if (timer !== null) clearInterval(timer);
-  timer = null;
-  playButton.textContent = '播放';
-}}
-
-function selectSample() {{
-  stopPlaying();
-  const data = trajectoryData[select.value];
-  const record = sampleRecords[Number(select.value)];
-  slider.max = String(Math.max(1, data.x.length));
-  slider.value = '1';
-  const warning = record.capture_counts.latent === 0 ? '\n⚠ 本样本没有生成 latent。' : '';
-  info.textContent = `问题: ${{record.question}}\n标准答案: ${{record.answer}}\n模型回答: ${{record.cleaned_output_text}}\n点数: ${{JSON.stringify(record.capture_counts)}}${{warning}}`;
-  filterCloud();
-  renderStep();
-}}
-
-select.addEventListener('change', selectSample);
-allCloud.addEventListener('change', filterCloud);
-slider.addEventListener('input', renderStep);
-playButton.addEventListener('click', () => {{
-  if (timer !== null) {{ stopPlaying(); return; }}
-  if (Number(slider.value) >= Number(slider.max)) slider.value = '1';
-  playButton.textContent = '暂停';
-  timer = setInterval(() => {{
-    slider.value = String(Number(slider.value) + 1);
-    renderStep();
-    if (Number(slider.value) >= Number(slider.max)) stopPlaying();
-  }}, {ANIMATION_INTERVAL_MS});
-}});
-selectSample();
-"""
-
-    output_html = pio.to_html(
-        figure,
-        include_plotlyjs=True,
-        full_html=True,
-        post_script=post_script,
-        config={"responsive": True, "displaylogo": False},
+    line_samples = (
+        np.concatenate(line_sample_blocks)
+        if line_sample_blocks else np.empty(0, dtype=np.int32)
     )
-    (output_path / "hrbench_trajectory.html").write_text(
-        output_html, encoding="utf-8"
+    line_steps = (
+        np.concatenate(line_step_blocks)
+        if line_step_blocks else np.empty(0, dtype=np.int32)
     )
+    line_count = len(line_steps)
+
+    trajectories = _new_vtp_polydata(trajectory_points["coordinates"])
+    trajectories.SetLines(_vtk_cell_array(
+        np.arange(0, 2 * line_count + 1, 2, dtype=np.int64),
+        line_connectivity,
+    ))
+    _add_vtp_point_data(trajectories, trajectory_points)
+    trajectories.GetCellData().AddArray(
+        _vtk_numeric_array(line_samples, "sample_ordinal")
+    )
+    trajectories.GetCellData().AddArray(
+        _vtk_numeric_array(line_steps, "trajectory_step")
+    )
+    _add_vtp_field_data(
+        trajectories, sample_records, explained_variance_ratio
+    )
+
+    _write_compressed_vtp(output_path / POINT_CLOUD_VTP_FILE, point_cloud)
+    _write_compressed_vtp(output_path / TRAJECTORY_VTP_FILE, trajectories)
+    return {
+        "point_cloud_points": point_count,
+        "point_cloud_vertex_cells": point_count,
+        "trajectory_points": len(trajectory_indices),
+        "trajectory_line_segments": line_count,
+    }
 
 
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
@@ -946,6 +914,7 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 def global_config_snapshot() -> dict[str, Any]:
     names = [
         "MODEL_PATH", "HRBENCH_DIR", "HRBENCH_FILE", "OUTPUT_DIR",
+        "POINT_CLOUD_VTP_FILE", "TRAJECTORY_VTP_FILE",
         "SELECTION_MODE", "START_INDEX", "NUM_SAMPLES", "RANDOM_SEED",
         "LATENT_SIZE", "TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION",
         "MAX_MODEL_LEN", "MAX_NUM_SEQS", "MAX_OUTPUT_TOKENS",
@@ -953,8 +922,7 @@ def global_config_snapshot() -> dict[str, Any]:
         "ENABLE_SLEEP_MODE", "MIN_PIXELS", "MAX_PIXELS", "TEMPERATURE",
         "TOP_K", "TOP_P", "REPETITION_PENALTY", "BEST_OF", "STOP",
         "PCA_FIT_POINTS_PER_KIND", "PCA_TRANSFORM_BATCH_SIZE",
-        "POINT_SIZE", "TRAJECTORY_POINT_SIZE", "CURRENT_POINT_SIZE",
-        "ANIMATION_INTERVAL_MS",
+        "VTP_COMPRESSION_LEVEL",
     ]
     return {name: globals()[name] for name in names}
 
@@ -1011,7 +979,7 @@ def main() -> None:
         gc.collect()
         save_pca_archive(output_path, points, pca, sample_records)
         write_jsonl(output_path / "results.jsonl", sample_records)
-        build_html(
+        vtp_statistics = build_vtp_outputs(
             output_path, points, sample_records, pca.explained_variance_ratio_
         )
 
@@ -1026,9 +994,29 @@ def main() -> None:
             "pca_explained_variance_ratio":
                 pca.explained_variance_ratio_.tolist(),
             "total_projected_points": int(len(points["coordinates"])),
+            "vtp_outputs": {
+                "point_cloud": POINT_CLOUD_VTP_FILE,
+                "trajectories": TRAJECTORY_VTP_FILE,
+                "compression": "appended binary with zlib",
+                "compression_level": VTP_COMPRESSION_LEVEL,
+                **vtp_statistics,
+            },
+            "paraview_filters": {
+                "sample_selection": (
+                    "Threshold Cell Data sample_ordinal to the selected sample"
+                ),
+                "trajectory_prefix": (
+                    "Threshold Cell Data trajectory_step from 0 through k"
+                ),
+                "current_token": (
+                    "Threshold Point Data sample_ordinal, then Point Data "
+                    "trajectory_step exactly to k on the point cloud"
+                ),
+            },
             "note": (
                 "Trajectory lines connect actual consumed input vectors in "
-                "sequence order; they are not attention paths."
+                "sequence order; image features are excluded from lines, "
+                "and the lines are not attention paths."
             ),
         }
         (output_path / "run_config.json").write_text(
@@ -1037,7 +1025,8 @@ def main() -> None:
         )
         succeeded = True
         print(f"Analysis complete: {output_path}")
-        print(f"Open: {output_path / 'hrbench_trajectory.html'}")
+        print(f"ParaView point cloud: {output_path / POINT_CLOUD_VTP_FILE}")
+        print(f"ParaView trajectories: {output_path / TRAJECTORY_VTP_FILE}")
     finally:
         os.environ.pop("MONET_ANALYSIS_CAPTURE_DIR", None)
         os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
