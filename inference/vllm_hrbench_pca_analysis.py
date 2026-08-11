@@ -711,29 +711,45 @@ def build_html(
 ) -> None:
     figure = go.Figure()
     coordinates = points["coordinates"]
-    for kind_code, kind_name in enumerate(KIND_NAMES.tolist()):
-        indices = np.flatnonzero(points["kind_codes"] == kind_code)
-        figure.add_trace(go.Scatter3d(
-            x=coordinates[indices, 0],
-            y=coordinates[indices, 1],
-            z=coordinates[indices, 2],
-            mode="markers",
-            name=kind_name,
-            customdata=point_customdata(points, indices, sample_records),
-            marker={
-                "size": POINT_SIZE,
-                "color": KIND_COLORS[kind_name],
-                "opacity": 0.18 if kind_name == "image_feature" else 0.55,
-            },
-            hovertemplate=(
-                "sample=%{customdata[0]}<br>kind=%{customdata[1]}<br>"
-                "token=%{customdata[2]}<br>token_id=%{customdata[3]}<br>"
-                "sequence_position=%{customdata[4]}<br>"
-                "generation_step=%{customdata[5]}<br>"
-                "latent_index=%{customdata[6]}<extra></extra>"
-            ),
-        ))
+    cloud_trace_indices = []
+    cloud_trace_samples = []
+    legend_kinds = set()
+    for sample_ordinal in range(len(sample_records)):
+        sample_mask = points["sample_ordinal"] == sample_ordinal
+        for kind_code, kind_name in enumerate(KIND_NAMES.tolist()):
+            indices = np.flatnonzero(
+                sample_mask & (points["kind_codes"] == kind_code)
+            )
+            if not indices.size:
+                continue
+            show_legend = kind_name not in legend_kinds
+            legend_kinds.add(kind_name)
+            cloud_trace_indices.append(len(figure.data))
+            cloud_trace_samples.append(sample_ordinal)
+            figure.add_trace(go.Scatter3d(
+                x=coordinates[indices, 0],
+                y=coordinates[indices, 1],
+                z=coordinates[indices, 2],
+                mode="markers",
+                name=kind_name,
+                legendgroup=kind_name,
+                showlegend=show_legend,
+                customdata=point_customdata(points, indices, sample_records),
+                marker={
+                    "size": POINT_SIZE,
+                    "color": KIND_COLORS[kind_name],
+                    "opacity": 0.18 if kind_name == "image_feature" else 0.55,
+                },
+                hovertemplate=(
+                    "sample=%{customdata[0]}<br>kind=%{customdata[1]}<br>"
+                    "token=%{customdata[2]}<br>token_id=%{customdata[3]}<br>"
+                    "sequence_position=%{customdata[4]}<br>"
+                    "generation_step=%{customdata[5]}<br>"
+                    "latent_index=%{customdata[6]}<extra></extra>"
+                ),
+            ))
 
+    trajectory_trace_index = len(figure.data)
     figure.add_trace(go.Scatter3d(
         x=[], y=[], z=[], mode="lines+markers", name="selected trajectory",
         line={"color": "#EAB308", "width": 6},
@@ -747,6 +763,7 @@ def build_html(
             "latent_index=%{customdata[6]}<extra></extra>"
         ),
     ))
+    current_point_trace_index = len(figure.data)
     figure.add_trace(go.Scatter3d(
         x=[], y=[], z=[], mode="markers", name="current token",
         marker={"size": CURRENT_POINT_SIZE, "color": "#EF4444",
@@ -820,10 +837,10 @@ def build_html(
 const gd = document.getElementById('{{plot_id}}');
 const trajectoryData = {trajectory_json};
 const sampleRecords = {records_json};
-const cloudStore = gd.data.slice(0, 4).map(trace => ({{
-  x: Array.from(trace.x), y: Array.from(trace.y), z: Array.from(trace.z),
-  customdata: Array.from(trace.customdata)
-}}));
+const cloudTraceIndices = {json.dumps(cloud_trace_indices)};
+const cloudTraceSamples = {json.dumps(cloud_trace_samples)};
+const trajectoryTraceIndex = {trajectory_trace_index};
+const currentPointTraceIndex = {current_point_trace_index};
 
 const controls = document.createElement('div');
 controls.style.cssText = 'font-family:Arial,sans-serif;background:#111827;color:#e5e7eb;padding:12px 16px;display:grid;grid-template-columns:minmax(220px,1fr) auto auto minmax(220px,2fr);gap:12px;align-items:center';
@@ -852,15 +869,10 @@ sampleRecords.forEach((record, index) => {{
 
 function filterCloud() {{
   const selected = Number(select.value);
-  cloudStore.forEach((store, traceIndex) => {{
-    const keep = store.customdata.map((row, i) => allCloud.checked || Number(row[7]) === selected ? i : -1).filter(i => i >= 0);
-    Plotly.restyle(gd, {{
-      x: [keep.map(i => store.x[i])],
-      y: [keep.map(i => store.y[i])],
-      z: [keep.map(i => store.z[i])],
-      customdata: [keep.map(i => store.customdata[i])]
-    }}, [traceIndex]);
-  }});
+  const visibility = cloudTraceSamples.map(sample =>
+    allCloud.checked || sample === selected
+  );
+  Plotly.restyle(gd, {{visible: visibility}}, cloudTraceIndices);
 }}
 
 function renderStep() {{
@@ -870,11 +882,11 @@ function renderStep() {{
   Plotly.restyle(gd, {{
     x: [data.x.slice(0, count)], y: [data.y.slice(0, count)],
     z: [data.z.slice(0, count)], customdata: [data.custom.slice(0, count)]
-  }}, [4]);
+  }}, [trajectoryTraceIndex]);
   Plotly.restyle(gd, {{
     x: [[data.x[current]]], y: [[data.y[current]]], z: [[data.z[current]]],
     customdata: [[JSON.stringify(data.custom[current])]]
-  }}, [5]);
+  }}, [currentPointTraceIndex]);
   const currentData = data.custom[current];
   stepLabel.textContent = `${{count}} / ${{data.x.length}} | ${{currentData ? currentData[1] + ': ' + JSON.stringify(currentData[2]) : ''}}`;
 }}
