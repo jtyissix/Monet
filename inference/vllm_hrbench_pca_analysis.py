@@ -14,8 +14,10 @@ from __future__ import annotations
 import base64
 import gc
 import io
+import inspect
 import json
 import os
+import sys
 import re
 import shutil
 import tempfile
@@ -23,7 +25,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-
+sys.path.insert(0, '/home/fit/renjujty/WORK/jty/Monet/')
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -35,8 +37,8 @@ from sklearn.decomposition import PCA
 # Global configuration -- edit values here; no command-line arguments are used
 # ---------------------------------------------------------------------------
 
-MODEL_PATH = "/path/to/your/Monet-7B"
-HRBENCH_DIR = "/path/to/your/HR-Bench"
+MODEL_PATH = "/home/fit/renjujty/WORK/jty/lmllms/monet/"
+HRBENCH_DIR = "/home/fit/renjujty/WORK/jty/lmllms/hrbench/"
 HRBENCH_FILE = "hr_bench_4k.parquet"
 OUTPUT_DIR = "outputs/hrbench_pca"
 
@@ -77,7 +79,7 @@ POINT_SIZE = 2.3
 TRAJECTORY_POINT_SIZE = 4.5
 CURRENT_POINT_SIZE = 9.0
 ANIMATION_INTERVAL_MS = 120
-CAPTURE_WAIT_SECONDS = 30
+CAPTURE_WAIT_SECONDS = 5
 KEEP_TEMP_CAPTURE_ON_ERROR = False
 
 
@@ -94,6 +96,7 @@ REQUIRED_COLUMNS = {
     "index", "question", "answer", "category", "A", "B", "C", "D",
     "cycle_category", "image",
 }
+MAX_PATH_CANDIDATE_LENGTH = 4096
 
 
 def replace_abs_vis_token_content(text: str) -> str:
@@ -101,6 +104,103 @@ def replace_abs_vis_token_content(text: str) -> str:
         r"(<abs_vis_token>)(.*?)(</abs_vis_token>)", flags=re.DOTALL
     )
     return pattern.sub(r"\1<latent>\3", text)
+
+
+def inspect_analysis_worker(worker) -> dict[str, Any]:
+    """Return recorder diagnostics from a vLLM worker via collective RPC."""
+    runner = getattr(worker, "model_runner", None)
+    if runner is None:
+        return {
+            "error": "worker has no model_runner attribute",
+            "worker_type": f"{type(worker).__module__}.{type(worker).__name__}",
+        }
+    runner_type = type(runner)
+    try:
+        runner_file = str(Path(inspect.getfile(runner_type)).resolve())
+    except (OSError, TypeError):
+        runner_file = "<unknown>"
+    capture_dir = getattr(runner, "analysis_capture_dir", None)
+    return {
+        "worker_type": f"{type(worker).__module__}.{type(worker).__name__}",
+        "runner_type": f"{runner_type.__module__}.{runner_type.__name__}",
+        "runner_file": runner_file,
+        "capture_enabled": bool(
+            getattr(runner, "analysis_capture_enabled", False)
+        ),
+        "capture_dir": str(capture_dir) if capture_dir is not None else None,
+        "has_flush_all": callable(
+            getattr(runner, "_analysis_flush_all_requests", None)
+        ),
+        "pending_request_ids": sorted(
+            getattr(runner, "analysis_capture_state", {}).keys()
+        ),
+    }
+
+
+def flush_analysis_worker(worker) -> dict[str, Any]:
+    """Synchronously flush pending captures inside the vLLM worker."""
+    runner = getattr(worker, "model_runner", None)
+    flush_all = getattr(runner, "_analysis_flush_all_requests", None)
+    if runner is None or not callable(flush_all):
+        return {
+            "error": "Monet analysis runner/flush method is unavailable",
+            "status": inspect_analysis_worker(worker),
+        }
+    pending_before = sorted(runner.analysis_capture_state.keys())
+    flushed = flush_all()
+    return {
+        "pending_before": pending_before,
+        "flushed_request_ids": sorted(flushed),
+        "pending_after": sorted(runner.analysis_capture_state.keys()),
+    }
+
+
+def validate_analysis_worker_statuses(
+    statuses: list[dict[str, Any]], capture_dir: Path
+) -> None:
+    expected_suffix = "/inference/vllm/monet_gpu_model_runner.py"
+    problems = []
+    if len(statuses) != 1:
+        problems.append(
+            f"expected exactly one TP=1 worker, received {len(statuses)}"
+        )
+    expected_capture_dir = capture_dir.resolve()
+    for index, status in enumerate(statuses):
+        runner_file = str(status.get("runner_file", "")).replace("\\", "/")
+        if status.get("error"):
+            problems.append(f"worker {index}: {status['error']}")
+        if not runner_file.endswith(expected_suffix):
+            problems.append(
+                f"worker {index}: unexpected runner file {runner_file!r}"
+            )
+        if not status.get("capture_enabled"):
+            problems.append(f"worker {index}: recorder is disabled")
+        if not status.get("has_flush_all"):
+            problems.append(f"worker {index}: flush-all method is missing")
+        actual_capture_dir = status.get("capture_dir")
+        if actual_capture_dir is None:
+            problems.append(f"worker {index}: capture directory is unset")
+        else:
+            try:
+                if Path(actual_capture_dir).resolve() != expected_capture_dir:
+                    problems.append(
+                        f"worker {index}: capture directory mismatch "
+                        f"({actual_capture_dir!r} != {str(expected_capture_dir)!r})"
+                    )
+            except OSError as exc:
+                problems.append(
+                    f"worker {index}: invalid capture directory: {exc}"
+                )
+    if problems:
+        details = json.dumps(statuses, ensure_ascii=False, indent=2)
+        raise RuntimeError(
+            "Monet analysis worker validation failed:\n- "
+            + "\n- ".join(problems)
+            + "\nWorker diagnostics:\n"
+            + details
+            + "\nSync both vllm_hrbench_pca_analysis.py and "
+            "inference/vllm/monet_gpu_model_runner.py on the GPU host."
+        )
 
 
 def select_sample_indices(
@@ -169,31 +269,69 @@ def load_hrbench_rows(dataset_path: Path) -> tuple[list[dict[str, Any]], list[in
     return [dict(dataset[index]) for index in selected], selected
 
 
+def _open_image_path(path_value: str, dataset_dir: Path) -> Image.Image | None:
+    """Open a plausible image path without leaking filesystem probe errors."""
+    if not path_value or "\x00" in path_value:
+        return None
+    try:
+        possible_path = Path(path_value).expanduser()
+        if not possible_path.is_absolute():
+            possible_path = dataset_dir / possible_path
+        if not possible_path.is_file():
+            return None
+    except (OSError, RuntimeError):
+        return None
+
+    try:
+        return Image.open(possible_path).convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"Unable to open image file: {possible_path}") from exc
+
+
+def _open_image_bytes(image_bytes: bytes, description: str) -> Image.Image:
+    try:
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"Unable to decode {description} as an image.") from exc
+
+
+def _decode_base64_image(encoded: str) -> Image.Image:
+    try:
+        image_bytes = base64.b64decode(encoded, validate=False)
+    except Exception as exc:
+        raise ValueError("The HR-Bench image contains invalid base64 data.") from exc
+    return _open_image_bytes(image_bytes, "HR-Bench base64 data")
+
+
 def decode_hrbench_image(value: Any, dataset_dir: Path) -> Image.Image:
     if isinstance(value, Image.Image):
         return value.convert("RGB")
     if isinstance(value, dict):
         if value.get("bytes") is not None:
-            return Image.open(io.BytesIO(value["bytes"])).convert("RGB")
+            return _open_image_bytes(value["bytes"], "HR-Bench byte data")
         if value.get("path"):
-            return Image.open(value["path"]).convert("RGB")
+            image = _open_image_path(str(value["path"]), dataset_dir)
+            if image is not None:
+                return image
+            raise ValueError(f"Image path does not exist: {value['path']}")
     if isinstance(value, (bytes, bytearray, memoryview)):
-        return Image.open(io.BytesIO(bytes(value))).convert("RGB")
+        return _open_image_bytes(bytes(value), "HR-Bench byte data")
     if not isinstance(value, str):
         raise TypeError(f"Unsupported HR-Bench image value: {type(value)!r}")
 
-    possible_path = Path(value).expanduser()
-    if not possible_path.is_absolute():
-        possible_path = dataset_dir / possible_path
-    if possible_path.is_file():
-        return Image.open(possible_path).convert("RGB")
+    value = value.strip()
+    if value.startswith("data:image/"):
+        if "," not in value:
+            raise ValueError("Malformed image data URI: missing comma separator.")
+        return _decode_base64_image(value.split(",", 1)[1])
 
-    encoded = value.split(",", 1)[1] if value.startswith("data:image/") else value
-    try:
-        image_bytes = base64.b64decode(encoded, validate=False)
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception as exc:
-        raise ValueError("The HR-Bench image is neither a path nor valid base64.") from exc
+    # HR-Bench stores large images as raw base64 strings. Never pass those
+    # strings to stat(2): Linux raises ENAMETOOLONG before we can fall back.
+    if len(value) <= MAX_PATH_CANDIDATE_LENGTH:
+        image = _open_image_path(value, dataset_dir)
+        if image is not None:
+            return image
+    return _decode_base64_image(value)
 
 
 def build_question(row: dict[str, Any]) -> str:
@@ -295,21 +433,49 @@ def run_inference(
 ):
     os.environ["LATENT_SIZE"] = str(LATENT_SIZE)
     os.environ["MONET_ANALYSIS_CAPTURE_DIR"] = str(capture_dir)
+    # vLLM V1 otherwise starts a separate EngineCore process. sys.modules
+    # patches made by apply_vllm_monet are process-local and would be lost.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     engine, sampling_params, processor = initialize_vllm(model_path)
+    worker_statuses = engine.collective_rpc(
+        inspect_analysis_worker, timeout=CAPTURE_WAIT_SECONDS
+    )
+    validate_analysis_worker_statuses(worker_statuses, capture_dir)
+    print(
+        "[Monet analysis] validated worker:\n"
+        + json.dumps(worker_statuses, ensure_ascii=False, indent=2)
+    )
     conversations, images = build_conversations(rows, dataset_dir)
     try:
         inputs = process_messages(conversations, processor)
         outputs = engine.generate(
             inputs, sampling_params=sampling_params, use_tqdm=True
         )
+        flush_results = engine.collective_rpc(
+            flush_analysis_worker, timeout=None
+        )
+        flush_errors = [
+            result for result in flush_results if result.get("error")
+        ]
+        if flush_errors:
+            raise RuntimeError(
+                "Failed to flush Monet analysis captures:\n"
+                + json.dumps(flush_errors, ensure_ascii=False, indent=2)
+            )
+        print(
+            "[Monet analysis] capture flush complete:\n"
+            + json.dumps(flush_results, ensure_ascii=False, indent=2)
+        )
     finally:
         for image in images:
             image.close()
-    return outputs, processor
+    return outputs, processor, worker_statuses
 
 
 def wait_for_captures(
-    capture_dir: Path, request_ids: Iterable[str]
+    capture_dir: Path,
+    request_ids: Iterable[str],
+    worker_statuses: list[dict[str, Any]] | None = None,
 ) -> dict[str, Path]:
     expected = set(request_ids)
     deadline = time.monotonic() + CAPTURE_WAIT_SECONDS
@@ -328,9 +494,17 @@ def wait_for_captures(
             return {request_id: found[request_id] for request_id in expected}
         time.sleep(0.25)
     missing = sorted(expected.difference(found))
+    directory_entries = (
+        sorted(path.name for path in capture_dir.iterdir())
+        if capture_dir.is_dir() else []
+    )
     raise RuntimeError(
         "Timed out waiting for runner captures. Missing request IDs: "
         + ", ".join(missing)
+        + f"\nCapture directory: {capture_dir}"
+        + f"\nDirectory entries: {directory_entries}"
+        + "\nWorker diagnostics:\n"
+        + json.dumps(worker_statuses or [], ensure_ascii=False, indent=2)
     )
 
 
@@ -779,7 +953,7 @@ def main() -> None:
     capture_dir = Path(tempfile.mkdtemp(prefix=".monet_capture_", dir=output_path))
     succeeded = False
     try:
-        outputs, processor = run_inference(
+        outputs, processor, worker_statuses = run_inference(
             model_path, rows, dataset_path.parent, capture_dir
         )
         if len(outputs) != len(rows):
@@ -812,7 +986,9 @@ def main() -> None:
                 "finish_reason": generated.finish_reason,
             })
 
-        capture_paths = wait_for_captures(capture_dir, request_ids)
+        capture_paths = wait_for_captures(
+            capture_dir, request_ids, worker_statuses
+        )
         captures = [load_capture(capture_paths[request_id])
                     for request_id in request_ids]
         pca, projected, available_counts = balanced_pca(captures)
@@ -830,6 +1006,8 @@ def main() -> None:
         run_config = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "config": global_config_snapshot(),
+            "vllm_enable_v1_multiprocessing": False,
+            "validated_worker_statuses": worker_statuses,
             "selected_dataset_ordinals": selected_indices,
             "pca_available_counts": available_counts,
             "pca_balanced_fit_points_per_nonempty_kind": PCA_FIT_POINTS_PER_KIND,
@@ -850,6 +1028,7 @@ def main() -> None:
         print(f"Open: {output_path / 'hrbench_trajectory.html'}")
     finally:
         os.environ.pop("MONET_ANALYSIS_CAPTURE_DIR", None)
+        os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
         if succeeded or not KEEP_TEMP_CAPTURE_ON_ERROR:
             shutil.rmtree(capture_dir, ignore_errors=True)
         elif capture_dir.exists():

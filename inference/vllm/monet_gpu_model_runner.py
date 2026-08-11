@@ -481,12 +481,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             row_start = row_end
 
-    def _analysis_flush_request(self, req_id: str) -> None:
+    def _analysis_flush_request(self, req_id: str) -> bool:
         if not self.analysis_capture_enabled:
-            return
+            return False
         state = self.analysis_capture_state.pop(req_id, None)
         if state is None or not state["vectors"]:
-            return
+            return False
         assert self.analysis_capture_dir is not None
 
         vectors = np.concatenate(state["vectors"], axis=0)
@@ -512,6 +512,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             latent_indices=latent_indices[order],
         )
         os.replace(temp_path, final_path)
+        return True
+
+    def _analysis_flush_all_requests(self) -> list[str]:
+        """Synchronously flush every pending capture; safe to call twice."""
+        flushed = []
+        for req_id in list(self.analysis_capture_state):
+            if self._analysis_flush_request(req_id):
+                flushed.append(req_id)
+        return flushed
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
