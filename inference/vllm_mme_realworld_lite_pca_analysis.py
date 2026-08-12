@@ -90,6 +90,10 @@ if MONET_REPO_DIR not in sys.path:
 
 KIND_NAMES = np.asarray(["vocabulary_embedding", "image_feature", "latent"])
 CHOICE_LABELS = "ABCDE"
+SYSTEM_PROMPT = (
+    "You are an expert multimodal large language model designed to reason "
+    "with latent visual embeddings."
+)
 REQUIRED_FIELDS = {
     "Question_id", "Image", "Text", "Answer choices", "Ground truth",
     "Task", "Subtask", "Category",
@@ -518,6 +522,10 @@ def build_conversations(
         image = decode_mme_realworld_image(row["Image"], image_dir)
         opened_images.append(image)
         conversations.append([
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
             {
                 "role": "user",
                 "content": [
@@ -1096,6 +1104,7 @@ def global_config_snapshot() -> dict[str, Any]:
         "SWAP_SPACE_GB", "DTYPE", "ENABLE_CHUNKED_PREFILL",
         "ENABLE_SLEEP_MODE", "MIN_PIXELS", "MAX_PIXELS", "TEMPERATURE",
         "TOP_K", "TOP_P", "REPETITION_PENALTY", "BEST_OF", "STOP",
+        "SYSTEM_PROMPT",
         "VOCAB_EMBEDDING_BATCH_SIZE", "PCA_TRANSFORM_BATCH_SIZE",
         "CAPTURE_WAIT_SECONDS", "KEEP_TEMP_CAPTURE_ON_ERROR",
         "MAX_MISSING_CAPTURE_FRACTION",
