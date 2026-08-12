@@ -76,8 +76,12 @@ STOP = None
 VOCAB_EMBEDDING_BATCH_SIZE = 8192
 PCA_TRANSFORM_BATCH_SIZE = 8192
 
-CAPTURE_WAIT_SECONDS = 5
+CAPTURE_WAIT_SECONDS = 20
 KEEP_TEMP_CAPTURE_ON_ERROR = False
+# Continue when only a small minority of requests lack capture files. PCA and
+# trajectory archives include captured samples only; results.jsonl keeps all
+# inference outputs and marks their capture status.
+MAX_MISSING_CAPTURE_FRACTION = 0.05
 
 
 if MONET_REPO_DIR not in sys.path:
@@ -671,11 +675,16 @@ def wait_for_captures(
     capture_dir: Path,
     request_ids: Iterable[str],
     worker_statuses: list[dict[str, Any]] | None = None,
-) -> dict[str, Path]:
-    expected = set(request_ids)
+) -> tuple[dict[str, Path], list[str]]:
+    requested = [str(request_id) for request_id in request_ids]
+    expected = set(requested)
+    if not requested:
+        raise ValueError("At least one request ID is required for capture lookup.")
+    if len(expected) != len(requested):
+        raise ValueError("Duplicate request IDs prevent reliable capture matching.")
     deadline = time.monotonic() + CAPTURE_WAIT_SECONDS
     found: dict[str, Path] = {}
-    while time.monotonic() < deadline:
+    while True:
         for path in capture_dir.glob("capture_*.npz"):
             if path.name.endswith(".tmp.npz"):
                 continue
@@ -686,21 +695,78 @@ def wait_for_captures(
             except (OSError, ValueError, KeyError):
                 continue
         if expected.issubset(found):
-            return {request_id: found[request_id] for request_id in expected}
+            return (
+                {request_id: found[request_id] for request_id in requested},
+                [],
+            )
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.25)
-    missing = sorted(expected.difference(found))
-    directory_entries = (
-        sorted(path.name for path in capture_dir.iterdir())
-        if capture_dir.is_dir() else []
+    available = {
+        request_id: found[request_id]
+        for request_id in requested
+        if request_id in found
+    }
+    missing = [request_id for request_id in requested if request_id not in found]
+    missing_fraction = len(missing) / len(requested)
+    if not available or missing_fraction > MAX_MISSING_CAPTURE_FRACTION:
+        raise RuntimeError(
+            "Timed out waiting for runner captures and the missing fraction "
+            f"{missing_fraction:.2%} exceeds the allowed "
+            f"{MAX_MISSING_CAPTURE_FRACTION:.2%}. Missing request IDs: "
+            + ", ".join(missing)
+            + f"\nCapture directory: {capture_dir}"
+            + "\nWorker diagnostics:\n"
+            + json.dumps(worker_statuses or [], ensure_ascii=False, indent=2)
+        )
+    print(
+        "[Monet analysis] WARNING: continuing with partial captures:\n"
+        + json.dumps(
+            {
+                "requested": len(requested),
+                "captured": len(available),
+                "missing": len(missing),
+                "missing_fraction": missing_fraction,
+                "missing_request_ids": missing,
+                "capture_directory": str(capture_dir),
+                "worker_diagnostics": worker_statuses or [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     )
-    raise RuntimeError(
-        "Timed out waiting for runner captures. Missing request IDs: "
-        + ", ".join(missing)
-        + f"\nCapture directory: {capture_dir}"
-        + f"\nDirectory entries: {directory_entries}"
-        + "\nWorker diagnostics:\n"
-        + json.dumps(worker_statuses or [], ensure_ascii=False, indent=2)
-    )
+    return available, missing
+
+
+def partition_capture_records(
+    sample_records: list[dict[str, Any]],
+    capture_paths: dict[str, Path],
+) -> tuple[list[dict[str, Any]], list[Path], list[dict[str, Any]]]:
+    captured_records = []
+    ordered_capture_paths = []
+    missing_records = []
+    for record in sample_records:
+        request_id = record["request_id"]
+        capture_path = capture_paths.get(request_id)
+        if capture_path is None:
+            record["capture_status"] = "missing"
+            record["pca_sample_ordinal"] = None
+            missing_records.append({
+                "sample_ordinal": record["sample_ordinal"],
+                "dataset_ordinal": record["dataset_ordinal"],
+                "dataset_index": record["dataset_index"],
+                "request_id": request_id,
+            })
+            continue
+
+        record["capture_status"] = "captured"
+        record["pca_sample_ordinal"] = len(captured_records)
+        captured_records.append(record)
+        ordered_capture_paths.append(capture_path)
+
+    if not captured_records:
+        raise RuntimeError("No captured samples are available for PCA.")
+    return captured_records, ordered_capture_paths, missing_records
 
 
 def scan_capture_counts(
@@ -1031,6 +1097,8 @@ def global_config_snapshot() -> dict[str, Any]:
         "ENABLE_SLEEP_MODE", "MIN_PIXELS", "MAX_PIXELS", "TEMPERATURE",
         "TOP_K", "TOP_P", "REPETITION_PENALTY", "BEST_OF", "STOP",
         "VOCAB_EMBEDDING_BATCH_SIZE", "PCA_TRANSFORM_BATCH_SIZE",
+        "CAPTURE_WAIT_SECONDS", "KEEP_TEMP_CAPTURE_ON_ERROR",
+        "MAX_MISSING_CAPTURE_FRACTION",
     ]
     return {name: globals()[name] for name in names}
 
@@ -1063,19 +1131,24 @@ def main() -> None:
             request_ids.append(request_id)
             sample_records.append(record)
 
-        capture_paths = wait_for_captures(
+        # Persist every model response before capture validation/PCA so a
+        # later analysis failure cannot discard a completed inference run.
+        write_jsonl(output_path / "results.jsonl", sample_records)
+
+        capture_paths, missing_request_ids = wait_for_captures(
             capture_dir, request_ids, worker_statuses
         )
-        ordered_capture_paths = [
-            capture_paths[request_id] for request_id in request_ids
-        ]
+        captured_records, ordered_capture_paths, missing_capture_records = (
+            partition_capture_records(sample_records, capture_paths)
+        )
+        write_jsonl(output_path / "results.jsonl", sample_records)
         vocabulary_vectors = np.load(
             Path(vocabulary_export["path"]), mmap_mode="r"
         )
         image_vectors, latent_vectors, metadata, capture_statistics = (
             extract_image_and_latent_vectors(
                 ordered_capture_paths,
-                sample_records,
+                captured_records,
                 target_image_count=len(vocabulary_vectors),
                 hidden_size=int(vocabulary_vectors.shape[1]),
                 temporary_dir=capture_dir,
@@ -1094,7 +1167,7 @@ def main() -> None:
             projected[2],
             metadata,
             pca,
-            sample_records,
+            captured_records,
         )
         del vocabulary_vectors, image_vectors, latent_vectors, projected
         gc.collect()
@@ -1111,6 +1184,16 @@ def main() -> None:
                 if key != "path"
             },
             "selected_dataset_ordinals": selected_indices,
+            "capture_summary": {
+                "requested_samples": len(sample_records),
+                "captured_samples": len(captured_records),
+                "missing_samples": len(missing_capture_records),
+                "missing_fraction": (
+                    len(missing_capture_records) / len(sample_records)
+                ),
+                "missing_request_ids": missing_request_ids,
+                "missing_records": missing_capture_records,
+            },
             "dataset_normalization_repairs": normalization_repairs,
             "capture_statistics": capture_statistics,
             "pca_input_counts": {
