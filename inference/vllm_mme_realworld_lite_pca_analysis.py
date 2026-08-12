@@ -37,10 +37,10 @@ from sklearn.decomposition import PCA
 MONET_REPO_DIR = "/home/fit/renjujty/WORK/jty/Monet/"
 MODEL_PATH = "/home/fit/renjujty/WORK/jty/lmllms/monet/"
 MME_REALWORLD_DIR = (
-    "/home/fit/renjujty/WORK/jty/lmllms/MME-RealWorld-Lite/extracted"
+    "/home/fit/renjujty/WORK/jty/lmllms/mmereal/extracted/data"
 )
-QUESTION_FILE = "MME_RealWorld.json"
-IMAGE_DIR = "."
+QUESTION_FILE = "MME-RealWorld-Lite.json"
+IMAGE_DIR = "./imgs/"
 OUTPUT_DIR = "outputs/mme_realworld_lite_pca"
 JOINT_PCA_FILE = "joint_pca_3d.npz"
 LATENT_TRAJECTORY_FILE = "latent_trajectories.npz"
@@ -49,7 +49,7 @@ LATENT_TRAJECTORY_FILE = "latent_trajectories.npz"
 # "random": deterministic sampling without replacement using RANDOM_SEED
 SELECTION_MODE = "random"
 START_INDEX = 0
-NUM_SAMPLES = 100
+NUM_SAMPLES = 1000
 RANDOM_SEED = 0
 
 LATENT_SIZE = 10
@@ -95,6 +95,7 @@ OFFICIAL_PROMPT_SUFFIX = (
     "the image. Respond with only the letter (A, B, C, D, or E) of the "
     "correct option.\nThe best answer is:"
 )
+CHOICE_REPAIRS_KEY = "_choice_normalization_repairs"
 
 
 def replace_abs_vis_token_content(text: str) -> str:
@@ -301,6 +302,67 @@ def validate_configuration() -> tuple[Path, Path, Path, Path]:
     )
 
 
+def _normalize_answer_choices(
+    choices: Any,
+    dataset_ordinal: int,
+    question_id: str,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    location = f"dataset row {dataset_ordinal} ({question_id})"
+    if not isinstance(choices, list):
+        raise TypeError(f"{location} Answer choices must be a list.")
+
+    parsed = []
+    repairs: list[dict[str, Any]] = []
+    for choice_index, choice in enumerate(choices):
+        if not isinstance(choice, str) or not choice.strip():
+            raise ValueError(
+                f"{location} choice {choice_index} must be a non-empty string."
+            )
+        stripped = choice.strip()
+        match = re.fullmatch(r"\(([A-E])\)\s*(.+)", stripped, flags=re.DOTALL)
+        if match is None:
+            raise ValueError(
+                f"{location} choice {choice_index} must start with an "
+                f"(A)-(E) label, got {choice!r}."
+            )
+        label, body = match.groups()
+        body = body.strip()
+        if not body:
+            raise ValueError(f"{location} choice {choice_index} has an empty body.")
+        parsed.append((label, body))
+        if not re.match(r"^\([A-E]\)\s", stripped):
+            repairs.append({
+                "type": "inserted_missing_space_after_choice_label",
+                "choice_index": choice_index,
+                "label": label,
+            })
+
+    actual_labels = "".join(label for label, _ in parsed)
+    if actual_labels == CHOICE_LABELS:
+        pass
+    elif (
+        actual_labels == "ABCDDE"
+        and parsed[4] == ("D", "None of the above")
+    ):
+        dropped_label, dropped_body = parsed.pop(4)
+        repairs.append({
+            "type": "removed_duplicate_none_of_the_above_choice",
+            "choice_index": 4,
+            "label": dropped_label,
+            "body": dropped_body,
+        })
+    else:
+        raise ValueError(
+            f"{location} has invalid Answer choice labels: "
+            f"{actual_labels!r}; expected {CHOICE_LABELS!r}, or the known "
+            "repairable 'ABCDDE' sequence with the second D equal to "
+            "'None of the above'."
+        )
+
+    normalized = [f"({label}) {body}" for label, body in parsed]
+    return normalized, repairs
+
+
 def _validate_mme_row(row: Any, dataset_ordinal: int) -> dict[str, Any]:
     location = f"dataset row {dataset_ordinal}"
     if not isinstance(row, dict):
@@ -316,20 +378,10 @@ def _validate_mme_row(row: Any, dataset_ordinal: int) -> dict[str, Any]:
         if not isinstance(row[field], str) or not row[field].strip():
             raise ValueError(f"{location} field {field!r} must be a non-empty string.")
 
-    choices = row["Answer choices"]
-    if not isinstance(choices, list) or len(choices) != len(CHOICE_LABELS):
-        raise ValueError(
-            f"{location} must contain exactly five Answer choices."
-        )
-    for label, choice in zip(CHOICE_LABELS, choices):
-        if not isinstance(choice, str) or not choice.strip():
-            raise ValueError(
-                f"{location} choice {label} must be a non-empty string."
-            )
-        if not re.match(rf"^\({label}\)\s+\S", choice.strip()):
-            raise ValueError(
-                f"{location} choice {label} must start with '({label}) '."
-            )
+    question_id = row["Question_id"].strip()
+    choices, choice_repairs = _normalize_answer_choices(
+        row["Answer choices"], dataset_ordinal, question_id
+    )
 
     answer = row["Ground truth"].strip().upper()
     if answer not in CHOICE_LABELS:
@@ -339,17 +391,19 @@ def _validate_mme_row(row: Any, dataset_ordinal: int) -> dict[str, Any]:
         )
 
     normalized = dict(row)
-    normalized["Question_id"] = row["Question_id"].strip()
+    normalized["Question_id"] = question_id
     normalized["Image"] = row["Image"].strip()
     normalized["Text"] = row["Text"].strip()
     normalized["Ground truth"] = answer
-    normalized["Answer choices"] = [choice.strip() for choice in choices]
+    normalized["Answer choices"] = choices
+    if choice_repairs:
+        normalized[CHOICE_REPAIRS_KEY] = choice_repairs
     return normalized
 
 
 def load_mme_realworld_rows(
     question_path: Path,
-) -> tuple[list[dict[str, Any]], list[int]]:
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]]]:
     try:
         with question_path.open("r", encoding="utf-8") as handle:
             dataset = json.load(handle)
@@ -365,8 +419,21 @@ def load_mme_realworld_rows(
     validated = [
         _validate_mme_row(row, index) for index, row in enumerate(dataset)
     ]
+    normalization_repairs = [
+        {
+            "dataset_ordinal": dataset_ordinal,
+            "question_id": row["Question_id"],
+            **repair,
+        }
+        for dataset_ordinal, row in enumerate(validated)
+        for repair in row.get(CHOICE_REPAIRS_KEY, [])
+    ]
     selected = select_sample_indices(len(validated))
-    return [validated[index] for index in selected], selected
+    return (
+        [validated[index] for index in selected],
+        selected,
+        normalization_repairs,
+    )
 
 
 def resolve_image_path(path_value: str, image_dir: Path) -> Path:
@@ -970,7 +1037,9 @@ def global_config_snapshot() -> dict[str, Any]:
 
 def main() -> None:
     model_path, question_path, image_dir, output_path = validate_configuration()
-    rows, selected_indices = load_mme_realworld_rows(question_path)
+    rows, selected_indices, normalization_repairs = load_mme_realworld_rows(
+        question_path
+    )
     capture_dir = Path(tempfile.mkdtemp(prefix=".monet_capture_", dir=output_path))
     succeeded = False
     try:
@@ -1042,6 +1111,7 @@ def main() -> None:
                 if key != "path"
             },
             "selected_dataset_ordinals": selected_indices,
+            "dataset_normalization_repairs": normalization_repairs,
             "capture_statistics": capture_statistics,
             "pca_input_counts": {
                 "vocabulary_embedding": int(vocabulary_export["vocab_size"]),
