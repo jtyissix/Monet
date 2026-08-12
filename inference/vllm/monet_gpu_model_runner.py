@@ -4,6 +4,7 @@ print("Replaced the original vllm gpu_model_runner with the Monet version.")
 import copy
 import gc
 import hashlib
+import json
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -365,6 +366,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info("Monet analysis capture enabled: %s",
                         self.analysis_capture_dir)
 
+        # Optional, analysis-only attention recorder. This is intentionally
+        # independent from MONET_ANALYSIS_CAPTURE_DIR so existing PCA and
+        # normal inference jobs keep exactly their previous behavior.
+        attention_capture = os.getenv("MONET_ATTENTION_CAPTURE", "0").strip()
+        self.attention_capture_enabled = attention_capture == "1"
+        self.attention_capture_dir: Optional[Path] = None
+        self.attention_capture_state: dict[str, dict[str, Any]] = {}
+        self.attention_layer_names: list[str] = []
+        self.attention_layer_indices: dict[str, int] = {}
+        self.attention_layer_group_ids: dict[str, int] = {}
+        self.attention_hook_handles: list[Any] = []
+        self.attention_step_records: dict[int, dict[str, Any]] = {}
+        self.attention_top_k = int(
+            os.getenv("MONET_ATTENTION_TOP_K", "20"))
+        attention_dtype_name = os.getenv(
+            "MONET_ATTENTION_STORAGE_DTYPE", "float16").strip().lower()
+        if attention_dtype_name not in {"float16", "float32"}:
+            raise ValueError(
+                "MONET_ATTENTION_STORAGE_DTYPE must be float16 or float32.")
+        self.attention_storage_dtype = np.dtype(attention_dtype_name)
+        special_ids = os.getenv(
+            "MONET_ATTENTION_SPECIAL_TOKEN_IDS", "").strip()
+        self.attention_special_token_ids = {
+            int(value) for value in special_ids.split(",") if value.strip()
+        }
+        if self.latent_start_id is not None:
+            self.attention_special_token_ids.add(self.latent_start_id)
+        if self.latent_end_id is not None:
+            self.attention_special_token_ids.add(self.latent_end_id)
+        if self.attention_capture_enabled:
+            capture_dir = os.getenv(
+                "MONET_ATTENTION_CAPTURE_DIR", "").strip()
+            if not capture_dir:
+                raise RuntimeError(
+                    "MONET_ATTENTION_CAPTURE_DIR is required when attention "
+                    "capture is enabled.")
+            if (self.parallel_config.tensor_parallel_size != 1
+                    or self.parallel_config.pipeline_parallel_size != 1):
+                raise RuntimeError(
+                    "Monet attention capture requires TP=1 and PP=1.")
+            if self.speculative_config is not None:
+                raise RuntimeError(
+                    "Monet attention capture does not support speculative "
+                    "decoding.")
+            if not torch.empty((), dtype=self.kv_cache_dtype).is_floating_point():
+                raise RuntimeError(
+                    "Monet attention capture requires a floating-point KV "
+                    "cache (cache_dtype=auto/bfloat16/float16).")
+            if self.attention_top_k <= 0:
+                raise ValueError("MONET_ATTENTION_TOP_K must be positive.")
+            self.attention_capture_dir = Path(
+                capture_dir).expanduser().resolve()
+            self.attention_capture_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("Monet attention capture enabled: %s",
+                        self.attention_capture_dir)
+
     def _analysis_export_vocabulary_embeddings(
             self, batch_size: int = 8192) -> dict[str, Any]:
         """Export the model's complete input embedding table in chunks."""
@@ -603,6 +660,365 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 flushed.append(req_id)
         return flushed
 
+    def _attention_start_request(
+            self, req_id: str, req_state: CachedRequestState) -> None:
+        if not self.attention_capture_enabled:
+            return
+        assert self.attention_capture_dir is not None
+        digest = hashlib.sha1(req_id.encode("utf-8")).hexdigest()[:12]
+        latent_path = self.attention_capture_dir / f"latent_{digest}.bin"
+        answer_path = self.attention_capture_dir / f"answer_{digest}.bin"
+        # A repeated request id represents a new logical request. Do not let
+        # stale spool bytes survive an aborted/resubmitted request.
+        latent_path.write_bytes(b"")
+        answer_path.write_bytes(b"")
+        image_positions = [
+            position for position in range(len(req_state.prompt_token_ids))
+            if self._analysis_is_image_position(req_state, position)
+        ]
+        self.attention_capture_state[req_id] = {
+            "request_id": req_id,
+            "prompt_token_ids": [int(x) for x in req_state.prompt_token_ids],
+            "prompt_length": len(req_state.prompt_token_ids),
+            "image_positions": image_positions,
+            "latent_positions": [],
+            "generated_token_ids": [],
+            "saw_latent": False,
+            "in_latent": False,
+            "latent_records": [],
+            "answer_records": [],
+            "latent_topk": [],
+            "latent_path": latent_path,
+            "answer_path": answer_path,
+        }
+
+    def _attention_ensure_request(self, req_id: str) -> dict[str, Any]:
+        state = self.attention_capture_state.get(req_id)
+        if state is None:
+            self._attention_start_request(req_id, self.requests[req_id])
+            state = self.attention_capture_state[req_id]
+        return state
+
+    def _attention_refresh_layer_groups(self) -> None:
+        if self.attention_layer_group_ids or not hasattr(
+                self, "kv_cache_config"):
+            return
+        for group_id, group in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                self.attention_layer_group_ids[layer_name] = group_id
+
+    def _attention_install_hooks(self) -> None:
+        if not self.attention_capture_enabled:
+            return
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        decoder_layers = [
+            (name, layer) for name, layer in layers.items()
+            if layer.attn_type == AttentionType.DECODER
+        ]
+        if not decoder_layers:
+            raise RuntimeError(
+                "No vLLM decoder Attention layers were found; Monet "
+                "attention analysis supports the native Qwen2 decoder only.")
+
+        def layer_number(item: tuple[str, Attention]) -> int:
+            name = item[0]
+            marker = ".layers."
+            if marker not in name:
+                raise RuntimeError(
+                    f"Unexpected Qwen2 attention layer name: {name}")
+            suffix = name.split(marker, 1)[1]
+            try:
+                return int(suffix.split(".", 1)[0])
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Cannot parse decoder layer index from {name}") from exc
+
+        decoder_layers.sort(key=layer_number)
+        parsed_indices = [layer_number(item) for item in decoder_layers]
+        if parsed_indices != list(range(len(parsed_indices))):
+            raise RuntimeError(
+                "Qwen2 decoder layers are incomplete or non-contiguous: "
+                f"{parsed_indices}")
+        self.attention_layer_names = [name for name, _ in decoder_layers]
+        self.attention_layer_indices = {
+            name: index for index, name in enumerate(self.attention_layer_names)
+        }
+        for name, layer in decoder_layers:
+            if layer.num_heads % layer.num_kv_heads != 0:
+                raise RuntimeError(
+                    f"Unsupported attention head layout in {name}.")
+            handle = layer.register_forward_hook(self._attention_layer_hook)
+            self.attention_hook_handles.append(handle)
+        logger.info("Installed Monet hooks on %d Qwen2 decoder layers.",
+                    len(decoder_layers))
+
+    def _attention_prepare_step(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        latent_rows: dict[int, int],
+    ) -> None:
+        if not self.attention_capture_enabled:
+            return
+        self.attention_step_records = {}
+        row_start = 0
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            row_count = int(num_scheduled_tokens[req_index])
+            row_end = row_start + row_count
+            if row_count <= 0:
+                row_start = row_end
+                continue
+            req_state = self.requests[req_id]
+            self._attention_ensure_request(req_id)
+            sequence_start = int(req_state.num_computed_tokens)
+            selected_rows = set(range(row_start, row_end)).intersection(
+                latent_rows)
+            # This row is the query used by vLLM to sample the next token.
+            # Do not reconstruct unused sampling rows during partial prefill.
+            if sequence_start + row_count >= req_state.num_tokens:
+                selected_rows.add(row_end - 1)
+            for global_row in sorted(selected_rows):
+                local_row = global_row - row_start
+                self.attention_step_records[global_row] = {
+                    "req_id": req_id,
+                    "sequence_position": sequence_start + local_row,
+                    "latent_index": latent_rows.get(global_row),
+                    "is_prediction_query": global_row == row_end - 1,
+                    "layer_weights": {},
+                }
+            row_start = row_end
+
+    def _attention_layer_hook(
+        self,
+        layer: Attention,
+        args: tuple[Any, ...],
+        _output: Any,
+    ) -> None:
+        if not self.attention_step_records or len(args) < 3:
+            return
+        query = args[0]
+        if not isinstance(query, torch.Tensor):
+            raise RuntimeError("Attention hook did not receive a query tensor.")
+        layer_name = layer.layer_name
+        layer_index = self.attention_layer_indices.get(layer_name)
+        if layer_index is None:
+            raise RuntimeError(f"Unregistered attention layer: {layer_name}")
+        self._attention_refresh_layer_groups()
+        group_id = self.attention_layer_group_ids.get(layer_name)
+        if group_id is None:
+            raise RuntimeError(
+                f"No KV-cache group found for attention layer {layer_name}.")
+        impl = layer.impl
+        if getattr(impl, "alibi_slopes", None) is not None:
+            raise RuntimeError("Attention capture does not support ALiBi.")
+        if float(getattr(impl, "logits_soft_cap", 0.0) or 0.0) != 0.0:
+            raise RuntimeError(
+                "Attention capture does not support logits soft-capping.")
+        kv_cache = layer.kv_cache[get_forward_context().virtual_engine]
+        if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
+            raise RuntimeError(
+                "Unexpected KV-cache layout for attention capture: "
+                f"{tuple(kv_cache.shape)}")
+        key_cache = kv_cache[0]
+        block_size = int(key_cache.shape[1])
+        query = query.view(-1, layer.num_heads, layer.head_size)
+        window = getattr(impl, "sliding_window", (-1, -1))
+        left_window = int(window[0]) if window is not None else -1
+
+        for global_row, record in self.attention_step_records.items():
+            sequence_position = int(record["sequence_position"])
+            source_start = 0
+            if left_window >= 0:
+                source_start = max(0, sequence_position - left_window)
+            source_positions = list(
+                range(source_start, sequence_position + 1))
+            req_state = self.requests[record["req_id"]]
+            block_ids = req_state.block_ids[group_id]
+            physical_blocks = torch.tensor(
+                [block_ids[pos // block_size] for pos in source_positions],
+                dtype=torch.long,
+                device=self.device,
+            )
+            block_offsets = torch.tensor(
+                [pos % block_size for pos in source_positions],
+                dtype=torch.long,
+                device=self.device,
+            )
+            keys = key_cache[physical_blocks, block_offsets]
+            if keys.shape[1] != layer.num_kv_heads:
+                raise RuntimeError("KV head count changed during capture.")
+            repeats = layer.num_heads // layer.num_kv_heads
+            if repeats > 1:
+                keys = torch.repeat_interleave(keys, repeats, dim=1)
+            q = query[global_row].to(dtype=torch.float32)
+            k = keys.to(dtype=torch.float32)
+            logits = torch.einsum("hd,shd->hs", q, k) * float(impl.scale)
+            probabilities = torch.softmax(logits, dim=-1).mean(dim=0)
+            full = torch.zeros(
+                sequence_position + 1,
+                dtype=torch.float32,
+                device=probabilities.device,
+            )
+            full[source_start:] = probabilities
+            record["layer_weights"][layer_index] = full.to(
+                device="cpu").numpy()
+
+    def _attention_append_record(
+        self,
+        state: dict[str, Any],
+        stream: str,
+        record: dict[str, Any],
+        predicted_token_id: Optional[int] = None,
+        output_index: Optional[int] = None,
+    ) -> None:
+        weights_by_layer = record["layer_weights"]
+        if len(weights_by_layer) != len(self.attention_layer_names):
+            raise RuntimeError(
+                "Not every decoder layer produced attention weights: "
+                f"{len(weights_by_layer)} != {len(self.attention_layer_names)}")
+        matrix = np.stack([
+            weights_by_layer[layer_index]
+            for layer_index in range(len(self.attention_layer_names))
+        ]).astype(self.attention_storage_dtype, copy=False)
+        path: Path = state[f"{stream}_path"]
+        offset = path.stat().st_size // self.attention_storage_dtype.itemsize
+        with path.open("ab") as handle:
+            matrix.tofile(handle)
+        metadata = {
+            "query_sequence_position": int(record["sequence_position"]),
+            "source_count": int(matrix.shape[1]),
+            "layer_count": int(matrix.shape[0]),
+            "offset": int(offset),
+        }
+        if record.get("latent_index") is not None:
+            metadata["latent_index"] = int(record["latent_index"])
+        if predicted_token_id is not None:
+            metadata["predicted_token_id"] = int(predicted_token_id)
+        if output_index is not None:
+            metadata["output_index"] = int(output_index)
+        state[f"{stream}_records"].append(metadata)
+
+    def _attention_capture_latent_topk(
+        self, latent_rows: dict[int, int]
+    ) -> None:
+        if not self.attention_capture_enabled or not latent_rows:
+            return
+        ordered_rows = sorted(latent_rows)
+        row_tensor = torch.tensor(
+            ordered_rows, dtype=torch.long, device=self.device)
+        latent_vectors = self.inputs_embeds.index_select(0, row_tensor)
+        logits = self.model.compute_logits(latent_vectors, None)
+        if logits is None:
+            raise RuntimeError("The model output head returned no logits.")
+        k = min(self.attention_top_k, int(logits.shape[-1]))
+        values, token_ids = torch.topk(logits.float(), k=k, dim=-1)
+        values_cpu = values.to(device="cpu").numpy()
+        ids_cpu = token_ids.to(device="cpu").numpy()
+        for item_index, global_row in enumerate(ordered_rows):
+            record = self.attention_step_records.get(global_row)
+            if record is None:
+                raise RuntimeError("Latent top-k row was not staged.")
+            state = self._attention_ensure_request(record["req_id"])
+            sequence_position = int(record["sequence_position"])
+            if any(
+                int(item["query_sequence_position"]) == sequence_position
+                for item in state["latent_topk"]
+            ):
+                continue
+            state["latent_topk"].append({
+                "query_sequence_position": sequence_position,
+                "latent_index": int(latent_rows[global_row]),
+                "token_ids": ids_cpu[item_index].astype(int).tolist(),
+                "logits": values_cpu[item_index].astype(float).tolist(),
+            })
+
+    def _attention_commit_latent_queries(self) -> None:
+        if not self.attention_capture_enabled:
+            return
+        for record in self.attention_step_records.values():
+            if record.get("latent_index") is None:
+                continue
+            state = self._attention_ensure_request(record["req_id"])
+            sequence_position = int(record["sequence_position"])
+            if sequence_position not in state["latent_positions"]:
+                state["latent_positions"].append(sequence_position)
+                self._attention_append_record(state, "latent", record)
+
+    def _attention_commit_sampled_tokens(
+        self, sampled_token_ids: list[list[int]]
+    ) -> None:
+        if not self.attention_capture_enabled:
+            return
+        row_ends = self.query_start_loc_cpu[1:self.input_batch.num_reqs + 1]
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            sampled_ids = sampled_token_ids[req_index]
+            if not sampled_ids:
+                continue
+            if len(sampled_ids) != 1:
+                raise RuntimeError(
+                    "Attention capture requires non-speculative one-token "
+                    "decoding.")
+            global_row = int(row_ends[req_index].item()) - 1
+            record = self.attention_step_records.get(global_row)
+            if record is None or not record["is_prediction_query"]:
+                raise RuntimeError("Missing generation-aligned attention query.")
+            token_id = int(sampled_ids[0])
+            state = self._attention_ensure_request(req_id)
+            output_index = len(state["generated_token_ids"])
+            state["generated_token_ids"].append(token_id)
+            if token_id == self.latent_start_id:
+                state["saw_latent"] = True
+                state["in_latent"] = True
+                state["answer_records"].clear()
+                state["answer_path"].write_bytes(b"")
+                continue
+            if token_id == self.latent_end_id:
+                state["in_latent"] = False
+                continue
+            if state["in_latent"] or token_id in self.attention_special_token_ids:
+                continue
+            self._attention_append_record(
+                state,
+                "answer",
+                record,
+                predicted_token_id=token_id,
+                output_index=output_index,
+            )
+
+    def _attention_flush_request(self, req_id: str) -> bool:
+        if not self.attention_capture_enabled:
+            return False
+        state = self.attention_capture_state.pop(req_id, None)
+        if state is None:
+            return False
+        assert self.attention_capture_dir is not None
+        digest = hashlib.sha1(req_id.encode("utf-8")).hexdigest()[:12]
+        final_path = self.attention_capture_dir / f"attention_{digest}.json"
+        temporary_path = self.attention_capture_dir / f".{digest}.tmp.json"
+        payload = {
+            key: value for key, value in state.items()
+            if key not in {"latent_path", "answer_path"}
+        }
+        payload.update({
+            "latent_spool": state["latent_path"].name,
+            "answer_spool": state["answer_path"].name,
+            "layer_names": self.attention_layer_names,
+            "storage_dtype": self.attention_storage_dtype.name,
+            "special_token_ids": sorted(self.attention_special_token_ids),
+            "no_latent_fallback": not bool(state["saw_latent"]),
+        })
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary_path, final_path)
+        return True
+
+    def _attention_flush_all_requests(self) -> list[str]:
+        flushed = []
+        for req_id in list(self.attention_capture_state):
+            if self._attention_flush_request(req_id):
+                flushed.append(req_id)
+        return flushed
+
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -660,6 +1076,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self._analysis_flush_request(req_id)
+            self._attention_flush_request(req_id)
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
             self.latent_state.pop(req_id, None)
@@ -732,6 +1149,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             self._analysis_start_request(req_id,
                                          new_req_data.prompt_token_ids)
+            self._attention_start_request(req_id, self.requests[req_id])
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -1726,6 +2144,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 st["pending"] = None
             self._analysis_capture_inputs(num_scheduled_tokens_np,
                                           analysis_latent_rows)
+            self._attention_prepare_step(num_scheduled_tokens_np,
+                                         analysis_latent_rows)
+            self._attention_capture_latent_topk(analysis_latent_rows)
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
             input_ids = None
         else:
@@ -1783,6 +2204,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             hidden_states = model_output
             aux_hidden_states = None
+        self._attention_commit_latent_queries()
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -1932,6 +2354,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # store a detached 1D tensor [H]
                     st["pending"] = last_token_h[i].detach()
                     st["current_len"] +=1
+
+        self._attention_commit_sampled_tokens(valid_sampled_token_ids)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -2218,6 +2642,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info("Loading model from scratch...")
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config)
+            if self.attention_capture_enabled:
+                self._attention_install_hooks()
             if self.lora_config:
                 self.model = self.load_lora_model(self.model,
                                                   self.model_config,
