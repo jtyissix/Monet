@@ -11,6 +11,7 @@ TP=1, PP=1, eager execution, and a floating-point KV cache.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shutil
@@ -39,13 +40,15 @@ HRBENCH_FILE = "hr_bench_4k.parquet"
 OUTPUT_DIR = "outputs/hrbench_attention"
 RESULTS_FILE = "results.jsonl"
 RUN_CONFIG_FILE = "run_config.json"
+CATEGORY_ATTENTION_CSV_FILE = "category_attention.csv"
+LATENT_TOPK_CSV_FILE = "latent_topk.csv"
 ATTENTION_SUBDIR = "attention"
 PLOT_SUBDIR = "plots"
 
 # "sequential": START_INDEX ... START_INDEX + NUM_SAMPLES
 # "random": deterministic sampling without replacement using RANDOM_SEED
 SELECTION_MODE = "sequential"
-START_INDEX = 37
+START_INDEX = 199
 NUM_SAMPLES = 1
 RANDOM_SEED = 0
 
@@ -797,6 +800,132 @@ def decode_topk(data: dict[str, np.ndarray], tokenizer) -> list[dict[str, Any]]:
     return records
 
 
+def category_attention_csv_fieldnames() -> list[str]:
+    return [
+        "sample_ordinal", "dataset_ordinal", "dataset_index", "request_id",
+        "query_ordinal", "query_kind", "query_sequence_position",
+        "query_output_index", "query_predicted_token_id",
+        "query_predicted_text", "query_latent_index", "layer_index",
+        "layer_name", *SOURCE_KIND_NAMES.tolist(),
+    ]
+
+
+def latent_topk_csv_fieldnames(top_k: int = LATENT_TOP_K) -> list[str]:
+    fields = [
+        "sample_ordinal", "dataset_ordinal", "dataset_index", "request_id",
+        "latent_ordinal", "latent_index", "sequence_position",
+    ]
+    for rank in range(1, top_k + 1):
+        fields.extend([
+            f"top{rank}_text",
+            f"top{rank}_token_id",
+            f"top{rank}_raw_logit",
+        ])
+    return fields
+
+
+def build_category_attention_csv_rows(
+    data: dict[str, np.ndarray],
+    tokenizer,
+    *,
+    sample_ordinal: int,
+    dataset_ordinal: int,
+    dataset_index: Any,
+    request_id: str,
+) -> list[dict[str, Any]]:
+    masses = data["category_attention_mass"]
+    layer_names = data["layer_names"]
+    if masses.shape != (
+        len(data["query_kind_codes"]),
+        len(layer_names),
+        len(SOURCE_KIND_NAMES),
+    ):
+        raise ValueError(
+            "Unexpected category_attention_mass shape: "
+            f"{masses.shape}")
+    rows = []
+    for query_ordinal in range(len(data["query_kind_codes"])):
+        query_kind = int(data["query_kind_codes"][query_ordinal])
+        predicted_token_id = int(
+            data["query_predicted_token_ids"][query_ordinal])
+        predicted_text = (
+            tokenizer.decode([predicted_token_id], skip_special_tokens=False)
+            if predicted_token_id >= 0 else ""
+        )
+        common = {
+            "sample_ordinal": sample_ordinal,
+            "dataset_ordinal": int(dataset_ordinal),
+            "dataset_index": dataset_index,
+            "request_id": request_id,
+            "query_ordinal": query_ordinal,
+            "query_kind": str(QUERY_KIND_NAMES[query_kind]),
+            "query_sequence_position": int(
+                data["query_sequence_positions"][query_ordinal]),
+            "query_output_index": int(
+                data["query_output_indices"][query_ordinal]),
+            "query_predicted_token_id": predicted_token_id,
+            "query_predicted_text": predicted_text,
+            "query_latent_index": int(
+                data["query_latent_indices"][query_ordinal]),
+        }
+        for layer_index, layer_name in enumerate(layer_names):
+            row = {
+                **common,
+                "layer_index": layer_index,
+                "layer_name": str(layer_name),
+            }
+            for kind_index, kind_name in enumerate(SOURCE_KIND_NAMES):
+                row[str(kind_name)] = float(
+                    masses[query_ordinal, layer_index, kind_index])
+            rows.append(row)
+    return rows
+
+
+def build_latent_topk_csv_rows(
+    decoded_topk: list[dict[str, Any]],
+    *,
+    sample_ordinal: int,
+    dataset_ordinal: int,
+    dataset_index: Any,
+    request_id: str,
+    top_k: int = LATENT_TOP_K,
+) -> list[dict[str, Any]]:
+    rows = []
+    for latent_ordinal, latent_record in enumerate(decoded_topk):
+        candidates = latent_record["candidates"]
+        if len(candidates) != top_k:
+            raise ValueError(
+                f"Expected {top_k} top-k candidates, received "
+                f"{len(candidates)}.")
+        row = {
+            "sample_ordinal": sample_ordinal,
+            "dataset_ordinal": int(dataset_ordinal),
+            "dataset_index": dataset_index,
+            "request_id": request_id,
+            "latent_ordinal": latent_ordinal,
+            "latent_index": int(latent_record["latent_index"]),
+            "sequence_position": int(latent_record["sequence_position"]),
+        }
+        for rank, candidate in enumerate(candidates, start=1):
+            if int(candidate["rank"]) != rank:
+                raise ValueError("Latent top-k ranks are not contiguous.")
+            row[f"top{rank}_text"] = candidate["decoded_text"]
+            row[f"top{rank}_token_id"] = int(candidate["token_id"])
+            row[f"top{rank}_raw_logit"] = float(candidate["raw_logit"])
+        rows.append(row)
+    return rows
+
+
+def write_csv(
+    path: Path, fieldnames: list[str], rows: Iterable[dict[str, Any]]
+) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
@@ -806,7 +935,8 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 def global_config_snapshot() -> dict[str, Any]:
     names = [
         "MODEL_PATH", "HRBENCH_DIR", "HRBENCH_FILE", "OUTPUT_DIR",
-        "RESULTS_FILE", "RUN_CONFIG_FILE", "ATTENTION_SUBDIR", "PLOT_SUBDIR",
+        "RESULTS_FILE", "RUN_CONFIG_FILE", "CATEGORY_ATTENTION_CSV_FILE",
+        "LATENT_TOPK_CSV_FILE", "ATTENTION_SUBDIR", "PLOT_SUBDIR",
         "SELECTION_MODE", "START_INDEX", "NUM_SAMPLES", "RANDOM_SEED",
         "LATENT_SIZE", "LATENT_TOP_K", "ATTENTION_STORAGE_DTYPE",
         "PLOT_LAYER", "PLOT_DPI", "PLOT_MAX_TOKEN_LABELS",
@@ -835,6 +965,8 @@ def main() -> None:
         manifests = wait_for_capture_manifests(capture_dir, request_ids)
         results = []
         capture_statistics = []
+        category_attention_csv_rows = []
+        latent_topk_csv_rows = []
         for sample_ordinal, (row, dataset_ordinal, output) in enumerate(
             zip(rows, selected_indices, outputs)
         ):
@@ -886,6 +1018,26 @@ def main() -> None:
             answer_mask = data["query_kind_codes"] == QUERY_ANSWER
             answer_ids = data["query_predicted_token_ids"][answer_mask].tolist()
             answer_output_indices = data["query_output_indices"][answer_mask].tolist()
+            decoded_topk = decode_topk(data, tokenizer)
+            category_attention_csv_rows.extend(
+                build_category_attention_csv_rows(
+                    data,
+                    tokenizer,
+                    sample_ordinal=sample_ordinal,
+                    dataset_ordinal=int(dataset_ordinal),
+                    dataset_index=row["index"],
+                    request_id=request_id,
+                )
+            )
+            latent_topk_csv_rows.extend(
+                build_latent_topk_csv_rows(
+                    decoded_topk,
+                    sample_ordinal=sample_ordinal,
+                    dataset_ordinal=int(dataset_ordinal),
+                    dataset_index=row["index"],
+                    request_id=request_id,
+                )
+            )
             result = {
                 "sample_ordinal": sample_ordinal,
                 "dataset_ordinal": int(dataset_ordinal),
@@ -906,7 +1058,7 @@ def main() -> None:
                 "answer_token_ids": answer_ids,
                 "answer_text": tokenizer.decode(
                     answer_ids, skip_special_tokens=False),
-                "latent_output_head_topk": decode_topk(data, tokenizer),
+                "latent_output_head_topk": decoded_topk,
                 "attention_archive": str(archive_rel),
                 "plots": {
                     "latent_attention": (
@@ -931,6 +1083,16 @@ def main() -> None:
             })
 
         write_jsonl(output_path / RESULTS_FILE, results)
+        write_csv(
+            output_path / CATEGORY_ATTENTION_CSV_FILE,
+            category_attention_csv_fieldnames(),
+            category_attention_csv_rows,
+        )
+        write_csv(
+            output_path / LATENT_TOPK_CSV_FILE,
+            latent_topk_csv_fieldnames(),
+            latent_topk_csv_rows,
+        )
         run_config = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "config": global_config_snapshot(),
@@ -954,6 +1116,8 @@ def main() -> None:
             },
             "outputs": {
                 "results": RESULTS_FILE,
+                "category_attention_csv": CATEGORY_ATTENTION_CSV_FILE,
+                "latent_topk_csv": LATENT_TOPK_CSV_FILE,
                 "attention_directory": ATTENTION_SUBDIR,
                 "plot_directory": PLOT_SUBDIR,
             },

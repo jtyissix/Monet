@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,11 +14,29 @@ from inference.vllm_hrbench_attention_analysis import (
     SOURCE_LATENT,
     SOURCE_SPECIAL,
     assemble_sample_archive,
+    build_category_attention_csv_rows,
+    build_latent_topk_csv_rows,
+    category_attention_csv_fieldnames,
     classify_source_positions,
+    latent_topk_csv_fieldnames,
     normalize_attention_groups,
     select_final_answer_token_indices,
     select_sample_indices,
+    write_csv,
 )
+
+
+class FakeTokenizer:
+    texts = {
+        7: "中文,\"候选\"\n下一行",
+        8: "plain",
+        30: "answer",
+    }
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(self.texts.get(int(token_id), f"t{token_id}")
+                       for token_id in token_ids)
 
 
 class AttentionAnalysisHelpersTest(unittest.TestCase):
@@ -182,6 +201,113 @@ class AttentionAnalysisHelpersTest(unittest.TestCase):
             self.assertEqual(data["query_kind_codes"].tolist(), [QUERY_ANSWER])
             self.assertEqual(data["latent_topk_token_ids"].shape, (0, 20))
             self.assertTrue(bool(data["no_latent_fallback"]))
+
+    def test_category_csv_rows_match_all_query_layer_masses(self):
+        data = {
+            "category_attention_mass": np.asarray([
+                [[0.1, 0.2, 0.3, 0.2, 0.2],
+                 [0.2, 0.1, 0.2, 0.3, 0.2]],
+                [[0.4, 0.1, 0.1, 0.2, 0.2],
+                 [0.3, 0.2, 0.1, 0.1, 0.3]],
+            ], dtype=np.float32),
+            "layer_names": np.asarray(["layers.0", "layers.1"]),
+            "query_kind_codes": np.asarray(
+                [QUERY_LATENT, QUERY_ANSWER], dtype=np.uint8),
+            "query_sequence_positions": np.asarray([4, 9]),
+            "query_output_indices": np.asarray([-1, 3]),
+            "query_predicted_token_ids": np.asarray([-1, 30]),
+            "query_latent_indices": np.asarray([0, -1]),
+        }
+        rows = build_category_attention_csv_rows(
+            data,
+            FakeTokenizer(),
+            sample_ordinal=2,
+            dataset_ordinal=11,
+            dataset_index="hr-11",
+            request_id="req-1",
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["query_kind"], "latent")
+        self.assertEqual(rows[2]["query_kind"], "answer")
+        self.assertEqual(rows[2]["query_predicted_text"], "answer")
+        self.assertEqual(rows[3]["layer_name"], "layers.1")
+        for row in rows:
+            self.assertAlmostEqual(
+                sum(float(row[name]) for name in [
+                    "input_text", "input_visual", "latent",
+                    "generated_text", "special",
+                ]),
+                1.0,
+                places=6,
+            )
+
+    def test_latent_topk_csv_uses_one_row_and_rank_columns(self):
+        decoded = [{
+            "latent_index": 4,
+            "sequence_position": 22,
+            "candidates": [{
+                "rank": 1,
+                "token_id": 7,
+                "decoded_text": FakeTokenizer.texts[7],
+                "raw_logit": 3.25,
+            }, {
+                "rank": 2,
+                "token_id": 8,
+                "decoded_text": FakeTokenizer.texts[8],
+                "raw_logit": 2.5,
+            }],
+        }]
+        rows = build_latent_topk_csv_rows(
+            decoded,
+            sample_ordinal=0,
+            dataset_ordinal=9,
+            dataset_index="hr-9",
+            request_id="req-2",
+            top_k=2,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["top1_text"], FakeTokenizer.texts[7])
+        self.assertEqual(rows[0]["top2_token_id"], 8)
+        self.assertEqual(rows[0]["top2_raw_logit"], 2.5)
+        self.assertEqual(len(latent_topk_csv_fieldnames(2)), 7 + 2 * 3)
+
+    def test_csv_writer_uses_bom_quoting_and_empty_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            populated = directory / "populated.csv"
+            fields = ["text", "value"]
+            write_csv(populated, fields, [{
+                "text": FakeTokenizer.texts[7],
+                "value": 1,
+            }])
+            raw = populated.read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+            with populated.open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows, [{
+                "text": FakeTokenizer.texts[7],
+                "value": "1",
+            }])
+
+            empty = directory / "empty.csv"
+            fields = category_attention_csv_fieldnames()
+            write_csv(empty, fields, [])
+            with empty.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                self.assertEqual(reader.fieldnames, fields)
+                self.assertEqual(list(reader), [])
+
+            empty_topk = directory / "empty_topk.csv"
+            topk_fields = latent_topk_csv_fieldnames(2)
+            write_csv(empty_topk, topk_fields, [])
+            with empty_topk.open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as handle:
+                reader = csv.DictReader(handle)
+                self.assertEqual(reader.fieldnames, topk_fields)
+                self.assertEqual(list(reader), [])
 
 
 if __name__ == "__main__":
